@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Result};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
@@ -15,9 +16,10 @@ pub fn create_memo_tx(
     message: &str,
     recent_blockhash: &solana_sdk::hash::Hash,
     tip_ix: Option<Instruction>,   // for the last tx in bundle
-) -> VersionedTransaction {
+) -> Result<VersionedTransaction> {
     let mut instructions = vec![Instruction::new_with_bytes(
-        Pubkey::from_str(MEMO_PROGRAM_ID).unwrap(),
+        Pubkey::from_str(MEMO_PROGRAM_ID)
+            .map_err(|e| anyhow!("Invalid Memo program ID: {}", e))?,
         message.as_bytes(),
         vec![AccountMeta::new(payer.pubkey(), true)],
     )];
@@ -26,15 +28,17 @@ pub fn create_memo_tx(
         instructions.push(tip);
     }
 
+    let msg = solana_sdk::message::v0::Message::try_compile(
+        &payer.pubkey(),
+        &instructions,
+        &[], // lookup tables
+        *recent_blockhash,
+    )
+    .map_err(|e| anyhow!("Failed to compile memo message: {}", e))?;
+
     VersionedTransaction::try_new(
-        solana_sdk::message::VersionedMessage::V0(
-            solana_sdk::message::v0::Message::try_compile(
-                &payer.pubkey(),
-                &instructions,
-                &[], // lookup tables
-                *recent_blockhash,
-            ).unwrap()
-        ),
-        &[payer]
-    ).unwrap()
+        solana_sdk::message::VersionedMessage::V0(msg),
+        &[payer],
+    )
+    .map_err(|e| anyhow!("Failed to sign memo transaction: {}", e))
 }

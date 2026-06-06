@@ -7,6 +7,10 @@ use std::str::FromStr;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use reqwest::Client;
 
+/// Hard cap on dynamic tips to prevent runaway costs during extreme congestion.
+/// 50_000_000 lamports = 0.05 SOL.
+const MAX_TIP_LAMPORTS: u64 = 50_000_000;
+
 /// Manages dynamic tip calculation for Jito bundles using real network data.
 #[derive(Clone)]
 pub struct TipManager {
@@ -19,9 +23,9 @@ pub struct TipManager {
 }
 
 impl TipManager {
-    pub fn new(rpc_url: &str, jito_url: &str) -> Self {
+    pub fn new(rpc_client: Arc<RpcClient>, jito_url: &str) -> Self {
         Self {
-            rpc_client: Arc::new(RpcClient::new(rpc_url.to_string())),
+            rpc_client,
             http_client: Client::new(),
             jito_url: jito_url.to_string(),
             recent_priority_fees: Arc::new(RwLock::new(vec![])),
@@ -138,8 +142,16 @@ impl TipManager {
             Some(balances.iter().sum::<u64>() / balances.len() as u64)
         };
 
-        let dynamic_tip = (avg_fee as f64 * congestion_factor * tip_pressure)
+        let uncapped_tip = (avg_fee as f64 * congestion_factor * tip_pressure)
             .max(base_lamports as f64) as u64;
+        let dynamic_tip = uncapped_tip.min(MAX_TIP_LAMPORTS);
+
+        if uncapped_tip > MAX_TIP_LAMPORTS {
+            warn!(
+                "Tip capped: {} → {} lamports (MAX_TIP_LAMPORTS={})",
+                uncapped_tip, dynamic_tip, MAX_TIP_LAMPORTS
+            );
+        }
 
         info!(
             "Dynamic tip: {} lamports (avg_fee={}, congestion={:.2}, tip_pressure={:.2}, fees_sampled={}, avg_balance={:?})",

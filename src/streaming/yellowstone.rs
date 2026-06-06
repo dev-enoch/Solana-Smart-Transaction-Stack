@@ -72,11 +72,10 @@ impl YellowstoneStreamer {
         endpoint: &str,
         x_token: Option<String>,
         event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
-        rpc_url: &str,
+        rpc_client: Arc<RpcClient>,
         payer_pubkey: String,
         jito_validators: HashSet<String>,
     ) -> Result<Self> {
-        let rpc_client = Arc::new(RpcClient::new(rpc_url.to_string()));
         Ok(Self {
             endpoint: endpoint.to_string(),
             x_token,
@@ -161,6 +160,12 @@ impl YellowstoneStreamer {
             
             backoff = Duration::from_secs(1);
             info!("Successfully connected to Yellowstone gRPC stream");
+
+            if let Ok(current) = self.rpc_client.get_slot().await {
+                if let Err(e) = self.update_leader_schedule(current).await {
+                    tracing::warn!("Failed to fetch leader schedule on connect: {}", e);
+                }
+            }
             
             let mut stream = response.into_inner();
 
@@ -169,6 +174,7 @@ impl YellowstoneStreamer {
                     match update_oneof {
                         UpdateOneof::Slot(slot) => {
                             let current_slot = slot.slot;
+                            let slot_status = slot.status;
                             if current_slot % 50 == 0 {
                                 let _ = self.update_leader_schedule(current_slot).await;
                             }
@@ -180,6 +186,7 @@ impl YellowstoneStreamer {
                                 slot: current_slot,
                                 timestamp: chrono::Utc::now(),
                                 leader,
+                                status: slot_status,
                             })).await {
                                 error!("Failed to send slot update: {:?}", e);
                                 break;
@@ -224,19 +231,5 @@ impl YellowstoneStreamer {
             }
         }
         false
-    }
-
-    pub async fn get_next_leader_window(&self, current_slot: u64) -> Option<u64> {
-        let schedule = self.leader_schedule.read().await;
-        // Look ahead up to 400 slots (1 epoch)
-        for i in 0..400 {
-            let slot = current_slot + i;
-            if let Some(leader) = schedule.get(&slot) {
-                if self.jito_validators.contains(leader) {
-                    return Some(slot);
-                }
-            }
-        }
-        None
     }
 }

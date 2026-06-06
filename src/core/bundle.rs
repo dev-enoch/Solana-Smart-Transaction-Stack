@@ -22,12 +22,12 @@ pub struct BundleBuilder {
 }
 
 impl BundleBuilder {
-    pub fn new(jito_url: &str, payer: Keypair, tip_manager: TipManager, rpc_url: &str) -> Self {
+    pub fn new(jito_url: &str, payer: Keypair, tip_manager: TipManager, rpc_client: Arc<RpcClient>) -> Self {
         Self {
             jito_url: jito_url.to_string(),
             payer: Arc::new(payer),
             tip_manager,
-            rpc_client: Arc::new(RpcClient::new(rpc_url.to_string())),
+            rpc_client,
             http_client: Client::new(),
         }
     }

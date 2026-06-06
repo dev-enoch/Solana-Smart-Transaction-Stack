@@ -4,13 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_sdk::signature::Signature;
-use solana_transaction_status::TransactionConfirmationStatus;
-use std::str::FromStr;
 
 use crate::types::lifecycle::LifecycleEntry;
 use crate::logging::{StructuredLogger, OperationalEvent};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::signature::Signature;
+use std::str::FromStr;
+
+/// Maximum number of retries before a bundle chain is abandoned.
+pub const MAX_RETRIES: u32 = 3;
 
 /// Tracks the full lifecycle of submitted bundles across all Solana commitment levels.
 #[derive(Clone)]
@@ -18,18 +20,18 @@ pub struct LifecycleTracker {
     entries: Arc<RwLock<HashMap<String, LifecycleEntry>>>,
     sig_to_bundle: Arc<RwLock<HashMap<String, String>>>,
     log_file: String,
-    rpc_client: Arc<RpcClient>,
     logger: StructuredLogger,
+    rpc_client: Arc<RpcClient>,
 }
 
 impl LifecycleTracker {
-    pub fn new(log_file: &str, rpc_url: &str, logger: StructuredLogger) -> Self {
+    pub fn new(log_file: &str, logger: StructuredLogger, rpc_client: Arc<RpcClient>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
             sig_to_bundle: Arc::new(RwLock::new(HashMap::new())),
             log_file: log_file.to_string(),
-            rpc_client: Arc::new(RpcClient::new(rpc_url.to_string())),
             logger,
+            rpc_client,
         }
     }
 
@@ -41,6 +43,7 @@ impl LifecycleTracker {
         tip: u64,
         signatures: Vec<String>,
         last_valid_block_height: u64,
+        retry_count: u32,
     ) {
         let entry = LifecycleEntry {
             bundle_id: bundle_id.clone(),
@@ -49,6 +52,7 @@ impl LifecycleTracker {
             tip_lamports: tip,
             last_valid_block_height: Some(last_valid_block_height),
             signatures: signatures.clone(),
+            retry_count,
             ..Default::default()
         };
         self.entries.write().await.insert(bundle_id.clone(), entry);
@@ -67,6 +71,29 @@ impl LifecycleTracker {
             "confirmed" => 2,
             "finalized" => 3,
             _ => 0,
+        }
+    }
+
+    /// Classify a transaction error string into a failure category.
+    pub fn classify_failure(error: &str) -> String {
+        let lower = error.to_lowercase();
+        if lower.contains("blockhashnotfound") || lower.contains("blockhash not found") {
+            "expired_blockhash".to_string()
+        } else if lower.contains("insufficientfunds") || lower.contains("insufficient funds")
+            || lower.contains("insufficient lamports")
+        {
+            "insufficient_funds".to_string()
+        } else if lower.contains("computationalbudgetexceeded")
+            || lower.contains("computational budget exceeded")
+            || lower.contains("exceeded CUs meter")
+        {
+            "compute_exceeded".to_string()
+        } else if lower.contains("alreadyprocessed") || lower.contains("already processed") {
+            "already_processed".to_string()
+        } else if lower.contains("bundle") {
+            "bundle_failure".to_string()
+        } else {
+            "transaction_error".to_string()
         }
     }
 
@@ -122,6 +149,8 @@ impl LifecycleTracker {
                 "finalized" if entry.finalized_at.is_none() => {
                     entry.finalized_at = Some(now);
                     entry.finalized_slot = Some(slot);
+                    let lat = (now - entry.submitted_at).num_milliseconds();
+                    entry.latency_finalized_ms = Some(lat);
                     if Self::commitment_ord("finalized") > Self::commitment_ord(&entry.status) {
                         entry.status = "finalized".to_string();
                     }
@@ -130,7 +159,7 @@ impl LifecycleTracker {
                         bundle_id: bundle_id.to_string(),
                         commitment: "finalized".to_string(),
                         slot,
-                        latency_ms: None,
+                        latency_ms: Some(lat),
                     })
                 }
                 "failed" if entry.status != "failed" => {
@@ -161,6 +190,36 @@ impl LifecycleTracker {
         }
     }
 
+    /// Record a failure with classification for a specific bundle.
+    pub async fn update_status_failed(&self, bundle_id: &str, error_msg: &str, slot: u64) {
+        let failure_type = Self::classify_failure(error_msg);
+        let event = {
+            let mut entries = self.entries.write().await;
+            if let Some(entry) = entries.get_mut(bundle_id) {
+                if entry.status != "failed" {
+                    entry.status = "failed".to_string();
+                    entry.failure_type = Some(failure_type.clone());
+                    Some(OperationalEvent::FailureDetected {
+                        timestamp: Utc::now(),
+                        bundle_id: bundle_id.to_string(),
+                        failure_type: failure_type.clone(),
+                        slot,
+                        details: error_msg.to_string(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(ref evt) = event {
+            self.logger.log(evt).await;
+            warn!("Classified failure for {}: {}", bundle_id, error_msg);
+        }
+    }
+
     /// Resolve a transaction signature to its bundle ID and update status.
     pub async fn update_status_by_sig(&self, signature: &str, commitment: &str, slot: u64) {
         let bundle_id = {
@@ -169,6 +228,17 @@ impl LifecycleTracker {
         };
         if let Some(bid) = bundle_id {
             self.update_status(&bid, commitment, slot).await;
+        }
+    }
+
+    /// Resolve a transaction signature to its bundle ID and update with classified failure.
+    pub async fn update_failure_by_sig(&self, signature: &str, error_msg: &str, slot: u64) {
+        let bundle_id = {
+            let map = self.sig_to_bundle.read().await;
+            map.get(signature).cloned()
+        };
+        if let Some(bid) = bundle_id {
+            self.update_status_failed(&bid, error_msg, slot).await;
         }
     }
 
@@ -183,7 +253,8 @@ impl LifecycleTracker {
     }
 
     /// Check for bundles whose blockhash has expired.
-    pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, u64, u64)> {
+    /// Returns (bundle_id, slot_submitted, tip_lamports, submitted_at_ms, retry_count).
+    pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, u64, u64, i64, u32)> {
         let mut expired = Vec::new();
         let mut entries = self.entries.write().await;
         for (bid, entry) in entries.iter_mut() {
@@ -192,8 +263,15 @@ impl LifecycleTracker {
                     if current_slot > lvbh {
                         entry.status = "failed".to_string();
                         entry.failure_type = Some("expired_blockhash".to_string());
+                        let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
                         warn!("Blockhash expiry detected for bundle {}", bid);
-                        expired.push((bid.clone(), entry.slot_submitted, entry.tip_lamports));
+                        expired.push((
+                            bid.clone(),
+                            entry.slot_submitted,
+                            entry.tip_lamports,
+                            age_ms,
+                            entry.retry_count,
+                        ));
                     }
                 }
             }
@@ -201,188 +279,152 @@ impl LifecycleTracker {
         expired
     }
 
-    /// Start a background task that polls RPC for commitment status updates.
-    pub fn start_commitment_poller(&self) {
-        let entries = self.entries.clone();
-        let rpc_client = self.rpc_client.clone();
-        let logger = self.logger.clone();
+    /// Advance commitment levels for tracked bundles based on stream slot updates.
+    pub async fn advance_commitments_by_slot(&self, current_slot: u64, status: i32) {
+        let target_commitment = match status {
+            1 => "confirmed",
+            2 => "finalized",
+            _ => return,
+        };
 
-        info!("Commitment poller started (3s interval, polling confirmed + finalized)");
+        let updates: Vec<(String, String, u64, Option<i64>)> = {
+            let mut entries = self.entries.write().await;
+            let mut updates = Vec::new();
 
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
-            loop {
-                interval.tick().await;
+            for (bid, entry) in entries.iter_mut() {
+                // Skip already-failed or already-finalized entries
+                if entry.status == "failed" || entry.status == "finalized" {
+                    continue;
+                }
 
-                // Collect signatures that need commitment polling
-                let sigs_to_check: Vec<(String, String)> = {
-                    let entries_map = entries.read().await;
-                    let mut result = Vec::new();
-                    for (bid, entry) in entries_map.iter() {
-                        // Only poll for entries that haven't reached finalized or failed
-                        if entry.status != "finalized" && entry.status != "failed" {
-                            for sig in &entry.signatures {
-                                result.push((sig.clone(), bid.clone()));
-                            }
-                        }
-                    }
-                    result
+                // Only advance bundles that have been processed at or before this slot
+                let processed_slot = match entry.processed_slot {
+                    Some(s) => s,
+                    None => continue,
                 };
 
-                if sigs_to_check.is_empty() {
+                if processed_slot > current_slot {
                     continue;
                 }
 
-                // Parse signature strings to Signature type
-                let parsed_sigs: Vec<(Signature, String)> = sigs_to_check
-                    .iter()
-                    .filter_map(|(sig_str, bid)| {
-                        Signature::from_str(sig_str).ok().map(|s| (s, bid.clone()))
-                    })
-                    .collect();
+                let now = Utc::now();
 
-                if parsed_sigs.is_empty() {
-                    continue;
-                }
-
-                let sig_refs: Vec<Signature> = parsed_sigs.iter().map(|(s, _)| *s).collect();
-
-                // Query signature statuses from RPC
-                match rpc_client.get_signature_statuses(&sig_refs).await {
-                    Ok(response) => {
-                        // Collect updates while holding the write lock briefly
-                        let updates: Vec<(String, String, u64)> = {
-                            let mut entries_map = entries.write().await;
-                            let mut updates = Vec::new();
-
-                            for (i, status_opt) in response.value.iter().enumerate() {
-                                if let Some(status) = status_opt {
-                                    let bid = &parsed_sigs[i].1;
-
-                                    if let Some(ref confirmation_status) =
-                                        status.confirmation_status
-                                    {
-                                        let commitment_str = match confirmation_status {
-                                            TransactionConfirmationStatus::Processed => "processed",
-                                            TransactionConfirmationStatus::Confirmed => "confirmed",
-                                            TransactionConfirmationStatus::Finalized => "finalized",
-                                        };
-
-                                        if let Some(entry) = entries_map.get_mut(bid.as_str()) {
-                                            let should_update = match
-                                                (entry.status.as_str(), commitment_str)
-                                            {
-                                                ("pending", _) => true,
-                                                ("processed", "confirmed" | "finalized") => true,
-                                                ("confirmed", "finalized") => true,
-                                                _ => false,
-                                            };
-
-                                            if should_update {
-                                                let now = Utc::now();
-                                                let mut updated = false;
-
-                                                match commitment_str {
-                                                    "processed"
-                                                        if entry.processed_at.is_none() =>
-                                                    {
-                                                        entry.processed_at = Some(now);
-                                                        entry.processed_slot = Some(status.slot);
-                                                        entry.latency_processed_ms = Some(
-                                                            (now - entry.submitted_at)
-                                                                .num_milliseconds(),
-                                                        );
-                                                        updated = true;
-                                                    }
-                                                    "confirmed"
-                                                        if entry.confirmed_at.is_none() =>
-                                                    {
-                                                        entry.confirmed_at = Some(now);
-                                                        entry.confirmed_slot = Some(status.slot);
-                                                        entry.latency_confirmed_ms = Some(
-                                                            (now - entry.submitted_at)
-                                                                .num_milliseconds(),
-                                                        );
-                                                        updated = true;
-                                                    }
-                                                    "finalized"
-                                                        if entry.finalized_at.is_none() =>
-                                                    {
-                                                        entry.finalized_at = Some(now);
-                                                        entry.finalized_slot = Some(status.slot);
-                                                        updated = true;
-                                                    }
-                                                    _ => {}
-                                                }
-
-                                                if updated {
-                                                    // Only advance status forward
-                                                    let new_ord = match commitment_str {
-                                                        "processed" => 1u8,
-                                                        "confirmed" => 2,
-                                                        "finalized" => 3,
-                                                        _ => 0,
-                                                    };
-                                                    let cur_ord = match entry.status.as_str() {
-                                                        "pending" => 0u8,
-                                                        "processed" => 1,
-                                                        "confirmed" => 2,
-                                                        "finalized" => 3,
-                                                        _ => 0,
-                                                    };
-                                                    if new_ord > cur_ord {
-                                                        entry.status =
-                                                            commitment_str.to_string();
-                                                    }
-
-                                                    updates.push((
-                                                        bid.clone(),
-                                                        commitment_str.to_string(),
-                                                        status.slot,
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                match target_commitment {
+                    "confirmed" if entry.confirmed_at.is_none() => {
+                        entry.confirmed_at = Some(now);
+                        entry.confirmed_slot = Some(current_slot);
+                        let lat = (now - entry.submitted_at).num_milliseconds();
+                        entry.latency_confirmed_ms = Some(lat);
+                        if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
+                            entry.status = "confirmed".to_string();
+                        }
+                        updates.push((bid.clone(), "confirmed".to_string(), current_slot, Some(lat)));
+                    }
+                    "finalized" => {
+                        // On finalized, also backfill confirmed if missing
+                        if entry.confirmed_at.is_none() {
+                            entry.confirmed_at = Some(now);
+                            entry.confirmed_slot = Some(current_slot);
+                            let lat = (now - entry.submitted_at).num_milliseconds();
+                            entry.latency_confirmed_ms = Some(lat);
+                            if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
+                                entry.status = "confirmed".to_string();
                             }
+                            updates.push((bid.clone(), "confirmed".to_string(), current_slot, Some(lat)));
+                        }
 
-                            updates
-                        }; // Write lock dropped here
-
-                        // Log updates outside the lock
-                        for (bid, commitment, slot) in &updates {
-                            let now = Utc::now();
-                            let lat = {
-                                let e = entries.read().await;
-                                e.get(bid.as_str()).and_then(|entry| {
-                                    match commitment.as_str() {
-                                        "processed" => entry.latency_processed_ms,
-                                        "confirmed" => entry.latency_confirmed_ms,
-                                        _ => None,
-                                    }
-                                })
-                            };
-
-                            logger
-                                .log(&OperationalEvent::CommitmentUpdate {
-                                    timestamp: now,
-                                    bundle_id: bid.clone(),
-                                    commitment: commitment.clone(),
-                                    slot: *slot,
-                                    latency_ms: lat,
-                                })
-                                .await;
-
-                            info!("[Poller] {} → {} (slot {})", bid, commitment, slot);
+                        if entry.finalized_at.is_none() {
+                            entry.finalized_at = Some(now);
+                            entry.finalized_slot = Some(current_slot);
+                            let lat = (now - entry.submitted_at).num_milliseconds();
+                            entry.latency_finalized_ms = Some(lat);
+                            if Self::commitment_ord("finalized") > Self::commitment_ord(&entry.status) {
+                                entry.status = "finalized".to_string();
+                            }
+                            updates.push((bid.clone(), "finalized".to_string(), current_slot, Some(lat)));
                         }
                     }
-                    Err(e) => {
-                        tracing::debug!("Commitment poll error: {}", e);
+                    _ => {}
+                }
+            }
+
+            updates
+        }; // Write lock dropped here
+
+        // Log updates outside the lock
+        for (bid, commitment, slot, lat) in &updates {
+            self.logger
+                .log(&OperationalEvent::CommitmentUpdate {
+                    timestamp: Utc::now(),
+                    bundle_id: bid.clone(),
+                    commitment: commitment.clone(),
+                    slot: *slot,
+                    latency_ms: *lat,
+                })
+                .await;
+
+            info!("[Stream] {} → {} (slot {})", bid, commitment, slot);
+        }
+    }
+
+    /// Poll `getSignatureStatuses` for pending/processed bundles as secondary confirmation.
+    /// This supplements the gRPC stream with RPC-based verification.
+    pub async fn poll_signature_statuses(&self) {
+        // Collect signatures that still need confirmation
+        let sigs_to_check: Vec<(String, String)> = {
+            let entries = self.entries.read().await;
+            entries
+                .values()
+                .filter(|e| e.status == "processed" || e.status == "confirmed")
+                .flat_map(|e| {
+                    e.signatures
+                        .iter()
+                        .map(|s| (s.clone(), e.bundle_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+
+        if sigs_to_check.is_empty() {
+            return;
+        }
+
+        // Parse signatures
+        let parsed: Vec<(Signature, String)> = sigs_to_check
+            .iter()
+            .filter_map(|(sig_str, bid)| {
+                Signature::from_str(sig_str)
+                    .ok()
+                    .map(|sig| (sig, bid.clone()))
+            })
+            .collect();
+
+        if parsed.is_empty() {
+            return;
+        }
+
+        let sig_refs: Vec<Signature> = parsed.iter().map(|(s, _)| *s).collect();
+
+        // Query confirmed status
+        match self.rpc_client.get_signature_statuses(&sig_refs).await {
+            Ok(response) => {
+                for (i, status_opt) in response.value.iter().enumerate() {
+                    if let Some(status) = status_opt {
+                        let bid = &parsed[i].1;
+                        if let Some(ref err) = status.err {
+                            self.update_status_failed(bid, &format!("{:?}", err), status.slot)
+                                .await;
+                        } else if let Some(ref confirmation) = status.confirmation_status {
+                            let commitment_str = format!("{:?}", confirmation).to_lowercase();
+                            self.update_status(bid, &commitment_str, status.slot).await;
+                        }
                     }
                 }
             }
-        });
+            Err(e) => {
+                tracing::debug!("Signature status poll failed: {:?}", e);
+            }
+        }
     }
 
     /// Persist all lifecycle entries to the JSON log file.

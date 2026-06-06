@@ -3,7 +3,7 @@ use dotenv::dotenv;
 use solana_smart_tx_stack_rs::ai::agent::AiAgent;
 use solana_smart_tx_stack_rs::core::bundle::BundleBuilder;
 use solana_smart_tx_stack_rs::core::tip::TipManager;
-use solana_smart_tx_stack_rs::core::tracker::LifecycleTracker;
+use solana_smart_tx_stack_rs::core::tracker::{LifecycleTracker, MAX_RETRIES};
 use solana_smart_tx_stack_rs::logging::{OperationalEvent, StructuredLogger};
 use solana_smart_tx_stack_rs::streaming::yellowstone::YellowstoneStreamer;
 use solana_smart_tx_stack_rs::types::ai::FailureContext;
@@ -16,7 +16,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Utc;
 
-#[allow(dead_code)]
+/// Maximum number of slots to wait for a Jito leader window before submitting anyway.
+/// Prevents queue starvation when Jito validators are not in the upcoming schedule.
+const MAX_WAIT_SLOTS: u64 = 100;
+
 #[derive(Debug, Clone)]
 struct Intent {
     id: String,
@@ -27,6 +30,8 @@ struct Intent {
     /// to simulate blockhash expiry for testing the AI retry pipeline.
     fault_inject_early_expiry: bool,
     target_slot: Option<u64>,
+    /// The slot at which this intent was first queued, used for fallback submission timing.
+    queued_at_slot: Option<u64>,
 }
 
 #[tokio::main]
@@ -71,8 +76,10 @@ async fn main() -> Result<()> {
         .expect("Failed to create structured logger");
 
 
+    // Single shared RPC client used by all components
     let rpc_client = Arc::new(RpcClient::new(rpc_url.clone()));
-    let tip_manager = TipManager::new(&rpc_url, &jito_url);
+
+    let tip_manager = TipManager::new(rpc_client.clone(), &jito_url);
 
     let payer_bytes = payer.to_bytes();
     let bundle_payer = solana_sdk::signature::Keypair::from_bytes(&payer_bytes).unwrap();
@@ -80,19 +87,18 @@ async fn main() -> Result<()> {
         &jito_url,
         bundle_payer,
         tip_manager.clone(),
-        &rpc_url,
+        rpc_client.clone(),
     ));
 
     let tracker = Arc::new(LifecycleTracker::new(
         "lifecycle_logs.json",
-        &rpc_url,
         logger.clone(),
+        rpc_client.clone(),
     ));
     let ai_agent = Arc::new(AiAgent::new(ai_api_url, ai_api_key, ai_model));
 
 
     tip_manager.start_tip_updater().await;
-    tracker.start_commitment_poller();
 
 
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(100);
@@ -101,7 +107,7 @@ async fn main() -> Result<()> {
         &endpoint,
         x_token,
         event_tx,
-        &rpc_url,
+        rpc_client.clone(),
         payer.pubkey().to_string(),
         jito_validators,
     )
@@ -129,6 +135,7 @@ async fn main() -> Result<()> {
                 override_tip: None,
                 fault_inject_early_expiry: false,
                 target_slot: None,
+                queued_at_slot: None,
             });
         }
 
@@ -140,6 +147,7 @@ async fn main() -> Result<()> {
             override_tip: None,
             fault_inject_early_expiry: true,
             target_slot: None,
+            queued_at_slot: None,
         });
 
         // Fault injection #2: simulated blockhash expiry
@@ -150,6 +158,7 @@ async fn main() -> Result<()> {
             override_tip: None,
             fault_inject_early_expiry: true,
             target_slot: None,
+            queued_at_slot: None,
         });
 
         info!(
@@ -169,6 +178,16 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Periodic signature status polling for secondary confirmation via RPC
+    let tracker_poll = tracker.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(8));
+        loop {
+            interval.tick().await;
+            tracker_poll.poll_signature_statuses().await;
+        }
+    });
+
 
     info!("Entering main event loop...");
 
@@ -177,9 +196,11 @@ async fn main() -> Result<()> {
             StreamEvent::Slot(update) => {
                 let current_slot = update.slot;
 
+                tracker.advance_commitments_by_slot(current_slot, update.status).await;
+
 
                 let expired_bundles = tracker.check_expiries(current_slot).await;
-                for (bundle_id, _slot_submitted, tip) in expired_bundles {
+                for (bundle_id, _slot_submitted, tip, age_ms, retry_count) in expired_bundles {
                     // Log the failure event
                     logger
                         .log(&OperationalEvent::FailureDetected {
@@ -192,12 +213,33 @@ async fn main() -> Result<()> {
                         })
                         .await;
 
+                    // Check retry cap before invoking AI
+                    if retry_count >= MAX_RETRIES {
+                        info!(
+                            "Retry cap reached for {} (retries: {}/{}). Abandoning bundle chain.",
+                            bundle_id, retry_count, MAX_RETRIES
+                        );
+                        logger
+                            .log(&OperationalEvent::FailureDetected {
+                                timestamp: Utc::now(),
+                                bundle_id: bundle_id.clone(),
+                                failure_type: "max_retries_exceeded".to_string(),
+                                slot: current_slot,
+                                details: format!(
+                                    "Bundle chain abandoned after {} retries (cap: {})",
+                                    retry_count, MAX_RETRIES
+                                ),
+                            })
+                            .await;
+                        continue;
+                    }
+
                     let ctx = FailureContext {
                         bundle_id: bundle_id.clone(),
                         failure_type: "expired_blockhash".to_string(),
                         slot: current_slot,
                         tip,
-                        latency: 5000,
+                        latency: age_ms,
                         extra: "Blockhash expired before transaction was included in a block"
                             .to_string(),
                     };
@@ -205,6 +247,7 @@ async fn main() -> Result<()> {
                     let ai = ai_agent.clone();
                     let q = intent_queue.clone();
                     let log = logger.clone();
+                    let next_retry = retry_count + 1;
 
                     tokio::spawn(async move {
                         match ai.decide_on_failure(ctx).await {
@@ -228,10 +271,11 @@ async fn main() -> Result<()> {
                                             id: new_id.clone(),
                                             memo: "smart-stack retry (refreshed blockhash)"
                                                 .to_string(),
-                                            retries: 1,
+                                            retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
                                             fault_inject_early_expiry: false,
                                             target_slot: None,
+                                            queued_at_slot: None,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -244,8 +288,8 @@ async fn main() -> Result<()> {
                                         .await;
 
                                         info!(
-                                            "AI → refresh_blockhash | tip: {:?}",
-                                            new_intent.override_tip
+                                            "AI → refresh_blockhash | tip: {:?} | retry {}/{}",
+                                            new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
                                         q.lock().await.push(new_intent);
                                     }
@@ -254,10 +298,11 @@ async fn main() -> Result<()> {
                                         let new_intent = Intent {
                                             id: new_id.clone(),
                                             memo: "smart-stack retry (higher tip)".to_string(),
-                                            retries: 1,
+                                            retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
                                             fault_inject_early_expiry: false,
                                             target_slot: None,
+                                            queued_at_slot: None,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -270,8 +315,8 @@ async fn main() -> Result<()> {
                                         .await;
 
                                         info!(
-                                            "AI → retry_higher_tip | tip: {:?}",
-                                            new_intent.override_tip
+                                            "AI → retry_higher_tip | tip: {:?} | retry {}/{}",
+                                            new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
                                         q.lock().await.push(new_intent);
                                     }
@@ -281,10 +326,11 @@ async fn main() -> Result<()> {
                                         let new_intent = Intent {
                                             id: new_id.clone(),
                                             memo: "smart-stack retry (waited for slot)".to_string(),
-                                            retries: 1,
+                                            retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
                                             fault_inject_early_expiry: false,
                                             target_slot: target,
+                                            queued_at_slot: None,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -299,7 +345,7 @@ async fn main() -> Result<()> {
                                         })
                                         .await;
 
-                                        info!("AI → wait until slot {:?}", target);
+                                        info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
                                         q.lock().await.push(new_intent);
                                     }
                                     "abort" | _ => {
@@ -312,10 +358,41 @@ async fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "AI decision failed for {}: {:?}",
+                                    "AI decision failed for {}: {:?}. Activating fallback retry.",
                                     bundle_id,
                                     e
                                 );
+
+                                let fallback_tip = (tip as f64 * 1.5) as u64;
+                                let new_id = format!("{}_retry_fallback", bundle_id);
+                                let new_intent = Intent {
+                                    id: new_id.clone(),
+                                    memo: "smart-stack retry (AI fallback: refresh blockhash)"
+                                        .to_string(),
+                                    retries: next_retry,
+                                    override_tip: Some(fallback_tip),
+                                    fault_inject_early_expiry: false,
+                                    target_slot: Some(current_slot + 5),
+                                    queued_at_slot: None,
+                                };
+
+                                log.log(&OperationalEvent::RetryQueued {
+                                    timestamp: Utc::now(),
+                                    original_bundle_id: bundle_id.clone(),
+                                    new_intent_id: new_id,
+                                    reason: format!(
+                                        "AI fallback: LLM unavailable ({:?}), auto-retry with refreshed blockhash and 1.5x tip",
+                                        e
+                                    ),
+                                    new_tip: Some(fallback_tip),
+                                })
+                                .await;
+
+                                info!(
+                                    "AI fallback → refresh_blockhash + wait 5 slots | tip: {} | retry {}/{}",
+                                    fallback_tip, next_retry, MAX_RETRIES
+                                );
+                                q.lock().await.push(new_intent);
                             }
                         }
                     });
@@ -324,6 +401,11 @@ async fn main() -> Result<()> {
 
                 let mut queue = intent_queue.lock().await;
                 if !queue.is_empty() {
+                    // Set queued_at_slot on first observation
+                    if queue[0].queued_at_slot.is_none() {
+                        queue[0].queued_at_slot = Some(current_slot);
+                    }
+
                     let is_optimal =
                         streamer.is_optimal_submission_window(current_slot).await;
                     let mut should_submit = false;
@@ -332,8 +414,25 @@ async fn main() -> Result<()> {
                         if current_slot >= target && is_optimal {
                             should_submit = true;
                         }
+                        // Fallback: if we've waited past target + MAX_WAIT_SLOTS, submit anyway
+                        if current_slot >= target + MAX_WAIT_SLOTS {
+                            info!(
+                                "Fallback submission: waited {}+ slots past target for {}",
+                                MAX_WAIT_SLOTS, queue[0].id
+                            );
+                            should_submit = true;
+                        }
                     } else if is_optimal {
                         should_submit = true;
+                    } else if let Some(queued_at) = queue[0].queued_at_slot {
+                        // Fallback: if intent has been waiting too long without a Jito window
+                        if current_slot >= queued_at + MAX_WAIT_SLOTS {
+                            info!(
+                                "Fallback submission: no Jito window for {}+ slots for {}",
+                                MAX_WAIT_SLOTS, queue[0].id
+                            );
+                            should_submit = true;
+                        }
                     }
 
                     if should_submit {
@@ -341,8 +440,8 @@ async fn main() -> Result<()> {
                         drop(queue); // Release lock before async work
 
                         info!(
-                            "--- Submitting Intent: {} at slot {} ---",
-                            intent.id, current_slot
+                            "--- Submitting Intent: {} at slot {} (retry {}/{}) ---",
+                            intent.id, current_slot, intent.retries, MAX_RETRIES
                         );
 
                         // Fetch fresh blockhash using async RPC
@@ -357,12 +456,19 @@ async fn main() -> Result<()> {
                         };
 
                         let memo_str = format!("{} slot {}", intent.memo, current_slot);
-                        let vtx = solana_smart_tx_stack_rs::core::memo::create_memo_tx(
+                        let vtx = match solana_smart_tx_stack_rs::core::memo::create_memo_tx(
                             &payer,
                             &memo_str,
                             &blockhash,
                             None,
-                        );
+                        ) {
+                            Ok(tx) => tx,
+                            Err(e) => {
+                                tracing::error!("Failed to create memo tx: {:?}", e);
+                                intent_queue.lock().await.insert(0, intent);
+                                continue;
+                            }
+                        };
 
                         let builder_clone = bundle_builder.clone();
                         let trk = tracker.clone();
@@ -401,6 +507,7 @@ async fn main() -> Result<()> {
                                         actual_tip,
                                         signatures.clone(),
                                         last_valid_block_height,
+                                        intent_clone.retries,
                                     )
                                     .await;
 
@@ -431,10 +538,12 @@ async fn main() -> Result<()> {
             }
             StreamEvent::Transaction(tx_update) => {
                 // Stream delivers processed-level notifications.
-                // Confirmed and finalized are tracked by the commitment poller.
-                if tx_update.error.is_some() {
+                // Confirmed and finalized are tracked by the commitment poller
+                // and the signature status polling task.
+                if let Some(ref error_msg) = tx_update.error {
+                    // Classify the failure type from the error message
                     tracker
-                        .update_status_by_sig(&tx_update.signature, "failed", tx_update.slot)
+                        .update_failure_by_sig(&tx_update.signature, error_msg, tx_update.slot)
                         .await;
                 } else {
                     tracker

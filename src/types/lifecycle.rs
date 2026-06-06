@@ -21,7 +21,9 @@ pub struct LifecycleEntry {
     pub failure_type: Option<String>, 
     pub latency_processed_ms: Option<i64>,
     pub latency_confirmed_ms: Option<i64>,
+    pub latency_finalized_ms: Option<i64>,
     pub last_valid_block_height: Option<u64>,
+    pub retry_count: u32,
     pub signatures: Vec<String>,
 }
 
@@ -42,7 +44,9 @@ impl Default for LifecycleEntry {
             failure_type: None,
             latency_processed_ms: None,
             latency_confirmed_ms: None,
+            latency_finalized_ms: None,
             last_valid_block_height: None,
+            retry_count: 0,
             signatures: Vec::new(),
         }
     }

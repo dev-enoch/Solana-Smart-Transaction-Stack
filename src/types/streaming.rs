@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 pub struct SlotUpdate {
     pub slot: u64,
     pub timestamp: DateTime<Utc>,
-    pub leader: Option<String>, // pubkey
+    pub leader: Option<String>,
+    
+    // 0 = Processed, 1 = Confirmed, 2 = Finalized, 3 = First shred received.
+    pub status: i32,
 }
 
 #[derive(Debug, Clone)]

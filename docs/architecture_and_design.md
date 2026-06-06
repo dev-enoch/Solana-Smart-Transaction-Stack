@@ -119,7 +119,7 @@ solana-smart-tx-stack-rs/
     |   +-- streaming.rs          # SlotUpdate, TransactionUpdate, and StreamEvent enum
     |
     +-- logging/
-        +-- mod.rs                # Reserved module for future structured logging extensions
+        +-- mod.rs                # StructuredLogger and OperationalEvent types (JSONL audit logging)
 ```
 
 ### Dependency Overview
@@ -238,14 +238,18 @@ The Tip Manager is responsible for providing dynamic, network-aware tip amounts 
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `_rpc_client` | `Arc<RpcClient>` | Solana RPC client for querying prioritization fees |
-| `recent_tips` | `Arc<RwLock<Vec<u64>>>` | Cached list of recent top prioritization fees (in lamports) |
+| `rpc_client` | `Arc<RpcClient>` | Shared Solana RPC client for querying prioritization fees and tip account balances |
+| `http_client` | `Client` | Reqwest HTTP client for Jito Block Engine API calls |
+| `jito_url` | `String` | Jito Block Engine base URL for fetching tip accounts |
+| `recent_priority_fees` | `Arc<RwLock<Vec<u64>>>` | Cached list of recent top prioritization fees (in lamports) |
+| `tip_account_balances` | `Arc<RwLock<Vec<u64>>>` | Cached balances of Jito tip accounts (tip competition indicator) |
+| `tip_accounts_cache` | `Arc<RwLock<Vec<Pubkey>>>` | Cached Jito tip account public keys |
 
 #### Key Methods
 
-**`new(rpc_url: &str) -> Self`**
+**`new(rpc_client: Arc<RpcClient>, jito_url: &str) -> Self`**
 
-Constructs a new Tip Manager with an empty recent tips cache.
+Constructs a new Tip Manager using a shared RPC client. Initializes empty caches for priority fees, tip balances, and tip accounts.
 
 **`get_tip_accounts(&self) -> Result<Vec<Pubkey>>`**
 
@@ -262,25 +266,23 @@ Returns the list of 8 known Jito tip accounts. These are the standard Jito tip d
 
 **`calculate_dynamic_tip(&self, base_lamports: u64, congestion_factor: f64) -> Result<u64>`**
 
-Calculates a dynamic tip using the following algorithm:
+Calculates a dynamic tip using a dual-signal algorithm:
 
-1. Read the cached `recent_tips`.
-2. If no recent tips are available, fall back to `base_lamports`.
-3. Otherwise, compute the arithmetic average of the cached tips.
-4. Multiply the average by the `congestion_factor`.
-5. Ensure the result is at least as large as `base_lamports` (floor enforcement).
+1. **Signal 1 — Priority Fees:** Read the cached `recent_priority_fees`. Compute the arithmetic average. If empty, fall back to `base_lamports`.
+2. **Signal 2 — Tip Pressure:** Read the cached `tip_account_balances`. Compute the average balance and derive a multiplier (1.0 to 2.0x). Higher accumulated balances indicate active tip competition.
+3. Compute: `uncapped_tip = avg_fee × congestion_factor × tip_pressure`.
+4. Apply floor enforcement: `max(uncapped_tip, base_lamports)`.
+5. Apply hard cap: `min(result, MAX_TIP_LAMPORTS)` where `MAX_TIP_LAMPORTS = 50,000,000` (0.05 SOL).
 6. Return the computed tip in lamports.
 
 **`start_tip_updater(&self)`**
 
-Spawns a background Tokio task that runs on a 10-second interval. On each tick, it:
+Spawns a background Tokio task that runs on a 10-second interval. On each tick, it performs two data fetches:
 
-1. Calls `get_recent_prioritization_fees(&[])` on the Solana RPC.
-2. Sorts the returned fees in descending order.
-3. Takes the top 20 non-zero fees.
-4. Updates the shared `recent_tips` cache.
+1. **Source 1 — Priority Fees:** Calls `get_recent_prioritization_fees(&[])` on the Solana RPC, sorts descending, takes the top 20 non-zero fees, and updates the `recent_priority_fees` cache.
+2. **Source 2 — Tip Account Balances:** Queries up to 3 Jito tip account balances via RPC to gauge tip competition pressure, and updates the `tip_account_balances` cache.
 
-If the RPC call fails, the error is logged and the previous cache is retained.
+If either RPC call fails, the error is logged and the previous cache is retained.
 
 ---
 
@@ -305,14 +307,14 @@ The Bundle Builder is responsible for constructing and submitting transaction bu
 
 #### Key Method: `build_and_submit`
 
-**Signature:** `async fn build_and_submit(&self, mut transactions: Vec<VersionedTransaction>, slot: u64) -> Result<(String, Vec<String>, u64)>`
+**Signature:** `async fn build_and_submit(&self, mut transactions: Vec<VersionedTransaction>, slot: u64, override_tip: Option<u64>) -> Result<(String, Vec<String>, u64, u64)>`
 
-**Returns:** A tuple of `(bundle_id, signatures, last_valid_block_height)`.
+**Returns:** A tuple of `(bundle_id, signatures, last_valid_block_height, tip_lamports)`.
 
 **Step-by-step execution:**
 
 1. **Fetch a tip account** from the `TipManager`. Uses the first account from the list.
-2. **Calculate the dynamic tip** by calling `calculate_dynamic_tip(10_000, 1.5)` with a base of 10,000 lamports and a 1.5x congestion factor.
+2. **Determine the tip:** If `override_tip` is provided (e.g., from the AI agent), use that value. Otherwise, **calculate the dynamic tip** by calling `calculate_dynamic_tip(10_000, 1.5)` with a base of 10,000 lamports and a 1.5x congestion factor.
 3. **Fetch a fresh blockhash** from the RPC using `confirmed` commitment level. This also retrieves `last_valid_block_height` for expiry tracking.
 4. **Build the tip transaction** as a `system_instruction::transfer` from the payer to the selected tip account.
 5. **Sign and append** the tip transaction to the end of the bundle's transaction list.
@@ -320,7 +322,7 @@ The Bundle Builder is responsible for constructing and submitting transaction bu
 7. **Construct the JSON-RPC payload** using the `sendBundle` method.
 8. **POST to the Jito Block Engine** at `{jito_url}/api/v1/bundles`.
 9. **Parse the response**, extracting the `bundle_id` from the `result` field.
-10. **Return** the bundle ID, all transaction signatures, and the `last_valid_block_height` for lifecycle tracking.
+10. **Return** the bundle ID, all transaction signatures, the `last_valid_block_height`, and the actual tip paid for lifecycle tracking.
 
 #### Error Handling
 
@@ -396,6 +398,7 @@ The AI Agent is the decision-making brain of the stack. When a bundle failure is
 | `client` | `Client` | Reqwest HTTP client for LLM API calls |
 | `api_url` | `String` | The LLM API endpoint URL |
 | `api_key` | `String` | Authentication key for the LLM API |
+| `model` | `String` | The LLM model name (e.g., `grok-3`, `gemini-2.5-flash`) |
 
 #### Key Methods
 
@@ -421,16 +424,20 @@ Constructs a detailed prompt that provides the LLM with:
 
 **`call_llm(prompt: &str) -> Result<String>`**
 
-Sends the prompt to the configured LLM API. The implementation:
+Sends the prompt to the configured LLM API. The implementation automatically detects the API format based on the URL:
 
-1. Constructs a JSON payload following the Google Generative AI format (with `contents`, `systemInstruction`, and `generationConfig` fields).
-2. Sets `temperature: 0.0` for deterministic output.
-3. Sets `responseMimeType: "application/json"` to request structured JSON output.
-4. Appends the API key as a query parameter.
-5. Sends the POST request and validates the response status.
-6. Extracts the generated text from `candidates[0].content.parts[0].text`.
-7. Strips any markdown code block wrappers (such as triple backtick json fences) that the LLM may include.
-8. Returns the cleaned JSON string.
+- **Google Generative AI** (URLs containing `googleapis.com` or `generativelanguage`):
+  1. Constructs a JSON payload with `contents`, `systemInstruction`, and `generationConfig` fields.
+  2. Sets `responseMimeType: "application/json"` for structured output.
+  3. Appends the API key as a query parameter.
+  4. Extracts the generated text from `candidates[0].content.parts[0].text`.
+
+- **OpenAI-compatible** (xAI/Grok, OpenAI, Groq, Together, etc.):
+  1. Constructs a standard chat completions payload with `messages` and `response_format: {"type": "json_object"}`.
+  2. Uses `Bearer` token authentication via the `Authorization` header.
+  3. Extracts the generated text from `choices[0].message.content`.
+
+Both formats set `temperature: 0.0` for deterministic output and strip any markdown code block wrappers from the response.
 
 #### Error Handling Philosophy
 
@@ -497,9 +504,10 @@ The orchestrator is the central coordinator of the entire stack. It initializes 
 6. Start the Tip Manager's background updater task via `start_tip_updater()`.
 7. Create the `mpsc::channel` for `StreamEvent` messages with a buffer size of 100.
 8. Instantiate the `YellowstoneStreamer` and spawn it as a background task.
-9. Populate the intent queue with 3 test intents (the 2nd one has fault injection enabled).
+9. Populate the intent queue with 10 test intents (8 normal + 2 with fault injection enabled).
 10. Spawn the lifecycle log persistence task (saves every 5 seconds).
-11. Enter the main event loop.
+11. Spawn the signature status polling task (polls every 8 seconds for secondary confirmation).
+12. Enter the main event loop.
 
 #### Intent Queue
 
@@ -509,10 +517,11 @@ The intent queue (`Arc<Mutex<Vec<Intent>>>`) holds a list of pending transaction
 | --- | --- | --- |
 | `id` | `String` | Unique identifier for the intent |
 | `memo` | `String` | The memo text to embed in the transaction |
-| `retries` | `u32` | Number of times this intent has been retried |
+| `retries` | `u32` | Number of times this intent has been retried (capped at `MAX_RETRIES = 3`) |
 | `override_tip` | `Option<u64>` | If set, overrides the default tip with this value |
-| `fault_inject_bad_blockhash` | `bool` | If `true`, replaces the blockhash with `Hash::default()` to simulate expiry |
+| `fault_inject_early_expiry` | `bool` | If `true`, artificially sets `last_valid_block_height` to `current_slot + 5` to simulate expiry |
 | `target_slot` | `Option<u64>` | If set, the intent will only be submitted at or after this slot |
+| `queued_at_slot` | `Option<u64>` | The slot at which this intent was first observed in the queue (for fallback submission timing) |
 
 #### Main Event Loop
 
@@ -521,27 +530,33 @@ The event loop processes `StreamEvent` messages from the Yellowstone Streamer ch
 **On `StreamEvent::Slot(update)`:**
 
 1. Record the `current_slot`.
-2. Check for expired bundles via `tracker.check_expiries(current_slot)`.
-3. For each expired bundle, construct a `FailureContext` and spawn an async task that:
-   - Calls `ai_agent.decide_on_failure(ctx)`.
-   - Matches the AI's decision and acts accordingly:
-     - `"refresh_blockhash"`: Creates a new intent with refreshed blockhash settings and the AI's suggested tip.
-     - `"retry_higher_tip"`: Creates a new intent with the AI's recommended higher tip amount.
-     - `"wait"`: Creates a new intent with a `target_slot` set to `current_slot + wait_slots`.
-     - `"abort"` (or any unknown action): Drops the intent entirely with a log message.
-4. Check the intent queue. If there are pending intents:
+2. Advance commitment levels for tracked bundles via `tracker.advance_commitments_by_slot(current_slot, status)`.
+3. Check for expired bundles via `tracker.check_expiries(current_slot)`.
+4. For each expired bundle:
+   - **Retry cap check:** If `retry_count >= MAX_RETRIES` (3), abandon the bundle chain and log the event.
+   - Otherwise, construct a `FailureContext` with real latency data (time since submission) and spawn an async task that:
+     - Calls `ai_agent.decide_on_failure(ctx)`.
+     - Matches the AI's decision and acts accordingly:
+       - `"refresh_blockhash"`: Creates a new intent with refreshed blockhash settings and the AI's suggested tip, incrementing `retries`.
+       - `"retry_higher_tip"`: Creates a new intent with the AI's recommended higher tip amount, incrementing `retries`.
+       - `"wait"`: Creates a new intent with a `target_slot` set to `current_slot + wait_slots`, incrementing `retries`.
+       - `"abort"` (or any unknown action): Drops the intent entirely with a log message.
+     - **Fallback on LLM failure:** If the AI API is unreachable, creates a retry intent with 1.5x the original tip and a 5-slot delay.
+5. Check the intent queue. If there are pending intents:
+   - Set `queued_at_slot` on first observation for fallback timing.
    - Call `streamer.is_optimal_submission_window(current_slot)` to check if a Jito validator is the leader in the next 4 slots.
    - If the first intent has a `target_slot`, also verify that `current_slot >= target_slot`.
-   - If both conditions are met, dequeue the intent and submit it:
-     - Fetch a fresh blockhash (or inject a bad one if fault injection is enabled).
-     - Build a memo transaction using `create_memo_tx` with the format `"{memo} slot {current_slot}"`.
+   - **Fallback submission:** If the intent has been waiting for `MAX_WAIT_SLOTS` (100) slots without a Jito leader window, submit anyway to prevent queue starvation.
+   - If submission conditions are met, dequeue the intent and submit it:
+     - Fetch a fresh blockhash.
+     - Build a memo transaction using `create_memo_tx` (returns `Result`, errors are handled gracefully).
      - Spawn an async task to call `bundle_builder.build_and_submit(...)`.
-     - On success, record the submission in the lifecycle tracker.
+     - On success, record the submission in the lifecycle tracker with the intent's `retry_count`.
 
 **On `StreamEvent::Transaction(tx_update)`:**
 
 1. Check the `error` field of the transaction update.
-2. If an error is present, update the status to `"failed"`.
+2. If an error is present, **classify the failure** (expired_blockhash, insufficient_funds, compute_exceeded, bundle_failure, or transaction_error) and update the tracker.
 3. If no error, update the status to `"processed"`.
 
 #### Concurrency Model
@@ -551,10 +566,11 @@ The orchestrator uses `tokio::spawn` extensively to avoid blocking the main even
 | Task | Lifetime | Description |
 | --- | --- | --- |
 | Yellowstone Streamer | Permanent | Maintains the gRPC connection and pushes events |
-| Tip Updater | Permanent | Polls RPC for prioritization fees every 10 seconds |
+| Tip Updater | Permanent | Polls RPC for prioritization fees and tip balances every 10 seconds |
 | Log Persistence | Permanent | Writes lifecycle entries to JSON every 5 seconds |
+| Signature Status Poller | Permanent | Polls `getSignatureStatuses` via RPC every 8 seconds for secondary confirmation |
 | Bundle Submission | Per-intent | Submits a single bundle and records the result |
-| AI Failure Handling | Per-failure | Calls the LLM and enqueues a retry intent |
+| AI Failure Handling | Per-failure | Calls the LLM and enqueues a retry intent (respecting retry cap) |
 
 ---
 
@@ -672,24 +688,37 @@ When a failure is detected, the full context (bundle ID, failure type, slot, tip
 | `wait` | Create a new intent with a `target_slot` offset, delaying submission |
 | `abort` | Drop the intent entirely, logging the decision |
 
-### Layer 4: Fault Injection (Testing)
+### Layer 4: Retry Cap and Circuit Breaker
 
-The second test intent is deliberately configured with `fault_inject_bad_blockhash: true`. This:
+The stack enforces a maximum retry count (`MAX_RETRIES = 3`) per bundle chain. When a bundle has been retried this many times, the system abandons the chain entirely and logs a `max_retries_exceeded` event. This prevents runaway tip escalation and infinite retry loops during sustained network issues.
 
-1. Replaces the real blockhash with `Hash::default()` (all zeros).
-2. Artificially sets the `last_valid_block_height` to `current_slot + 5` so the blockhash expires almost immediately.
+### Layer 5: Fallback Submission
 
-This allows end-to-end testing of the failure detection and AI retry pipeline without waiting for a natural blockhash expiry (which takes approximately 60 to 90 seconds).
+If an intent has been waiting in the queue for `MAX_WAIT_SLOTS` (100) slots without a Jito leader appearing in the schedule, the system submits anyway. This prevents queue starvation when the `JITO_VALIDATORS` configuration is incomplete or when Jito leaders are infrequent.
+
+### Layer 6: Fault Injection (Testing)
+
+Intents 9 and 10 are deliberately configured with `fault_inject_early_expiry: true`. This artificially sets the `last_valid_block_height` to `current_slot + 5` after the bundle is successfully submitted to Jito, so the tracker's expiry detector fires almost immediately. The transaction itself is valid — only the local expiry tracking is manipulated.
+
+This allows end-to-end testing of the failure detection, AI reasoning, and autonomous retry pipeline without waiting for a natural blockhash expiry (which takes approximately 60 to 90 seconds).
+
+### Layer 7: Secondary Confirmation via RPC Polling
+
+A background task polls `getSignatureStatuses` every 8 seconds for all bundles in `processed` or `confirmed` status. This supplements the gRPC stream with RPC-based verification, ensuring commitment progression is captured even if stream updates are missed due to brief disconnections.
 
 ### Failure Classifications
 
+The tracker classifies failures automatically from transaction error strings using pattern matching:
+
 | Failure Type | Trigger | Description |
 | --- | --- | --- |
-| `expired_blockhash` | `current_slot > last_valid_block_height` | The transaction's blockhash expired before landing |
-| `low_tip` | Reported by AI analysis | The tip was insufficient for the bundle to be prioritized |
-| `bundle_drop` | No commitment after timeout | The bundle was dropped by the Block Engine |
-| `compute_exceeded` | On-chain error | The transaction exceeded compute budget limits |
-| `leader_skip` | No commitment + slot progression | The assigned leader missed their slot |
+| `expired_blockhash` | `current_slot > last_valid_block_height` or error contains "BlockhashNotFound" | The transaction's blockhash expired before landing |
+| `insufficient_funds` | Error contains "InsufficientFunds" or "insufficient lamports" | The payer account lacks sufficient SOL |
+| `compute_exceeded` | Error contains "ComputationalBudgetExceeded" | The transaction exceeded compute budget limits |
+| `already_processed` | Error contains "AlreadyProcessed" | The transaction was already processed (duplicate submission) |
+| `bundle_failure` | Error contains "bundle" | A Jito Block Engine bundle-level failure |
+| `transaction_error` | Default classification | Any other on-chain transaction error |
+| `max_retries_exceeded` | `retry_count >= MAX_RETRIES` | Bundle chain abandoned after exceeding the retry cap |
 
 ---
 
