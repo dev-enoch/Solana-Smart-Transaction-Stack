@@ -1,8 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use dashmap::DashMap;
 use tracing::{info, warn};
 
 use crate::types::lifecycle::LifecycleEntry;
@@ -17,8 +16,8 @@ pub const MAX_RETRIES: u32 = 3;
 /// Tracks the full lifecycle of submitted bundles across all Solana commitment levels.
 #[derive(Clone)]
 pub struct LifecycleTracker {
-    entries: Arc<RwLock<HashMap<String, LifecycleEntry>>>,
-    sig_to_bundle: Arc<RwLock<HashMap<String, String>>>,
+    entries: Arc<DashMap<String, LifecycleEntry>>,
+    sig_to_bundle: Arc<DashMap<String, String>>,
     log_file: String,
     logger: StructuredLogger,
     rpc_client: Arc<RpcClient>,
@@ -27,8 +26,8 @@ pub struct LifecycleTracker {
 impl LifecycleTracker {
     pub fn new(log_file: &str, logger: StructuredLogger, rpc_client: Arc<RpcClient>) -> Self {
         Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
-            sig_to_bundle: Arc::new(RwLock::new(HashMap::new())),
+            entries: Arc::new(DashMap::new()),
+            sig_to_bundle: Arc::new(DashMap::new()),
             log_file: log_file.to_string(),
             logger,
             rpc_client,
@@ -55,11 +54,10 @@ impl LifecycleTracker {
             retry_count,
             ..Default::default()
         };
-        self.entries.write().await.insert(bundle_id.clone(), entry);
+        self.entries.insert(bundle_id.clone(), entry);
 
-        let mut sig_map = self.sig_to_bundle.write().await;
         for sig in signatures {
-            sig_map.insert(sig, bundle_id.clone());
+            self.sig_to_bundle.insert(sig, bundle_id.clone());
         }
     }
 
@@ -100,8 +98,7 @@ impl LifecycleTracker {
     /// Update the commitment status of a bundle.
     pub async fn update_status(&self, bundle_id: &str, commitment: &str, slot: u64) {
         let event = {
-            let mut entries = self.entries.write().await;
-            let entry = match entries.get_mut(bundle_id) {
+            let mut entry = match self.entries.get_mut(bundle_id) {
                 Some(e) => e,
                 None => return,
             };
@@ -194,8 +191,7 @@ impl LifecycleTracker {
     pub async fn update_status_failed(&self, bundle_id: &str, error_msg: &str, slot: u64) {
         let failure_type = Self::classify_failure(error_msg);
         let event = {
-            let mut entries = self.entries.write().await;
-            if let Some(entry) = entries.get_mut(bundle_id) {
+            if let Some(mut entry) = self.entries.get_mut(bundle_id) {
                 if entry.status != "failed" {
                     entry.status = "failed".to_string();
                     entry.failure_type = Some(failure_type.clone());
@@ -222,10 +218,7 @@ impl LifecycleTracker {
 
     /// Resolve a transaction signature to its bundle ID and update status.
     pub async fn update_status_by_sig(&self, signature: &str, commitment: &str, slot: u64) {
-        let bundle_id = {
-            let map = self.sig_to_bundle.read().await;
-            map.get(signature).cloned()
-        };
+        let bundle_id = self.sig_to_bundle.get(signature).map(|r| r.clone());
         if let Some(bid) = bundle_id {
             self.update_status(&bid, commitment, slot).await;
         }
@@ -233,10 +226,7 @@ impl LifecycleTracker {
 
     /// Resolve a transaction signature to its bundle ID and update with classified failure.
     pub async fn update_failure_by_sig(&self, signature: &str, error_msg: &str, slot: u64) {
-        let bundle_id = {
-            let map = self.sig_to_bundle.read().await;
-            map.get(signature).cloned()
-        };
+        let bundle_id = self.sig_to_bundle.get(signature).map(|r| r.clone());
         if let Some(bid) = bundle_id {
             self.update_status_failed(&bid, error_msg, slot).await;
         }
@@ -244,8 +234,7 @@ impl LifecycleTracker {
 
     /// Record a failure for a specific bundle.
     pub async fn record_failure(&self, bundle_id: &str, failure_type: String) {
-        let mut entries = self.entries.write().await;
-        if let Some(entry) = entries.get_mut(bundle_id) {
+        if let Some(mut entry) = self.entries.get_mut(bundle_id) {
             entry.status = "failed".to_string();
             entry.failure_type = Some(failure_type.clone());
             warn!("Recorded failure for {}: {}", bundle_id, failure_type);
@@ -256,8 +245,8 @@ impl LifecycleTracker {
     /// Returns (bundle_id, slot_submitted, tip_lamports, submitted_at_ms, retry_count).
     pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, u64, u64, i64, u32)> {
         let mut expired = Vec::new();
-        let mut entries = self.entries.write().await;
-        for (bid, entry) in entries.iter_mut() {
+        for mut entry in self.entries.iter_mut() {
+            let bid = entry.key().clone();
             if entry.status == "pending" {
                 if let Some(lvbh) = entry.last_valid_block_height {
                     if current_slot > lvbh {
@@ -266,7 +255,7 @@ impl LifecycleTracker {
                         let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
                         warn!("Blockhash expiry detected for bundle {}", bid);
                         expired.push((
-                            bid.clone(),
+                            bid,
                             entry.slot_submitted,
                             entry.tip_lamports,
                             age_ms,
@@ -288,10 +277,10 @@ impl LifecycleTracker {
         };
 
         let updates: Vec<(String, String, u64, Option<i64>)> = {
-            let mut entries = self.entries.write().await;
             let mut updates = Vec::new();
 
-            for (bid, entry) in entries.iter_mut() {
+            for mut entry in self.entries.iter_mut() {
+                let bid = entry.key().clone();
                 // Skip already-failed or already-finalized entries
                 if entry.status == "failed" || entry.status == "finalized" {
                     continue;
@@ -372,9 +361,8 @@ impl LifecycleTracker {
     pub async fn poll_signature_statuses(&self) {
         // Collect signatures that still need confirmation
         let sigs_to_check: Vec<(String, String)> = {
-            let entries = self.entries.read().await;
-            entries
-                .values()
+            self.entries
+                .iter()
                 .filter(|e| e.status == "processed" || e.status == "confirmed")
                 .flat_map(|e| {
                     e.signatures
@@ -429,8 +417,7 @@ impl LifecycleTracker {
 
     /// Persist all lifecycle entries to the JSON log file.
     pub async fn save_logs(&self) -> Result<()> {
-        let entries = self.entries.read().await;
-        let values: Vec<_> = entries.values().collect();
+        let values: Vec<_> = self.entries.iter().map(|e| e.value().clone()).collect();
         let json = serde_json::to_string_pretty(&values)?;
         tokio::fs::write(&self.log_file, json).await?;
         info!("Lifecycle logs saved ({} entries)", values.len());

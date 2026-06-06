@@ -196,13 +196,18 @@ impl TipManager {
                 let accounts = tip_accounts_cache.read().await.clone();
                 if !accounts.is_empty() {
                     let mut balances = Vec::new();
-                    // Sample up to 3 tip accounts to minimize RPC load
-                    for account in accounts.iter().take(3) {
-                        match rpc_client.get_balance(account).await {
-                            Ok(balance) => balances.push(balance),
-                            Err(e) => {
-                                tracing::debug!("Failed to query tip account {} balance: {}", account, e);
+                    // Sample up to 8 tip accounts using a single RPC call
+                    let subset: Vec<solana_sdk::pubkey::Pubkey> = accounts.iter().take(8).cloned().collect();
+                    match rpc_client.get_multiple_accounts(&subset).await {
+                        Ok(accs) => {
+                            for acc_opt in accs {
+                                if let Some(acc) = acc_opt {
+                                    balances.push(acc.lamports);
+                                }
                             }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to query multiple tip accounts balance: {}", e);
                         }
                     }
                     if !balances.is_empty() {

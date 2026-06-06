@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use solana_sdk::signature::Signer;
 use solana_client::nonblocking::rpc_client::RpcClient;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Utc;
@@ -121,14 +122,14 @@ async fn main() -> Result<()> {
     });
 
 
-    let intent_queue = Arc::new(Mutex::new(vec![]));
+    let intent_queue = Arc::new(Mutex::new(VecDeque::new()));
 
     {
         let mut queue = intent_queue.lock().await;
 
         // 8 normal bundle submissions
         for i in 1..=8 {
-            queue.push(Intent {
+            queue.push_back(Intent {
                 id: format!("bundle_{}", i),
                 memo: format!("smart-stack bundle #{}", i),
                 retries: 0,
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
         }
 
         // Fault injection #1: simulated blockhash expiry
-        queue.push(Intent {
+        queue.push_back(Intent {
             id: "bundle_9_fault_expiry".to_string(),
             memo: "smart-stack fault-inject expiry #1".to_string(),
             retries: 0,
@@ -151,7 +152,7 @@ async fn main() -> Result<()> {
         });
 
         // Fault injection #2: simulated blockhash expiry
-        queue.push(Intent {
+        queue.push_back(Intent {
             id: "bundle_10_fault_expiry".to_string(),
             memo: "smart-stack fault-inject expiry #2".to_string(),
             retries: 0,
@@ -291,7 +292,7 @@ async fn main() -> Result<()> {
                                             "AI → refresh_blockhash | tip: {:?} | retry {}/{}",
                                             new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
-                                        q.lock().await.push(new_intent);
+                                        q.lock().await.push_back(new_intent);
                                     }
                                     "retry_higher_tip" => {
                                         let new_id = format!("{}_retry_tip", bundle_id);
@@ -318,7 +319,7 @@ async fn main() -> Result<()> {
                                             "AI → retry_higher_tip | tip: {:?} | retry {}/{}",
                                             new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
-                                        q.lock().await.push(new_intent);
+                                        q.lock().await.push_back(new_intent);
                                     }
                                     "wait" => {
                                         let target = decision.wait_slots.map(|w| current_slot + w);
@@ -346,7 +347,7 @@ async fn main() -> Result<()> {
                                         .await;
 
                                         info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
-                                        q.lock().await.push(new_intent);
+                                        q.lock().await.push_back(new_intent);
                                     }
                                     "abort" | _ => {
                                         info!(
@@ -392,7 +393,7 @@ async fn main() -> Result<()> {
                                     "AI fallback → refresh_blockhash + wait 5 slots | tip: {} | retry {}/{}",
                                     fallback_tip, next_retry, MAX_RETRIES
                                 );
-                                q.lock().await.push(new_intent);
+                                q.lock().await.push_back(new_intent);
                             }
                         }
                     });
@@ -436,7 +437,7 @@ async fn main() -> Result<()> {
                     }
 
                     if should_submit {
-                        let intent = queue.remove(0);
+                        let intent = queue.pop_front().unwrap();
                         drop(queue); // Release lock before async work
 
                         info!(
@@ -450,7 +451,7 @@ async fn main() -> Result<()> {
                             Err(e) => {
                                 tracing::error!("Failed to get blockhash: {:?}", e);
                                 // Put intent back at front of queue
-                                intent_queue.lock().await.insert(0, intent);
+                                intent_queue.lock().await.push_front(intent);
                                 continue;
                             }
                         };
@@ -465,7 +466,7 @@ async fn main() -> Result<()> {
                             Ok(tx) => tx,
                             Err(e) => {
                                 tracing::error!("Failed to create memo tx: {:?}", e);
-                                intent_queue.lock().await.insert(0, intent);
+                                intent_queue.lock().await.push_front(intent);
                                 continue;
                             }
                         };
