@@ -23,15 +23,8 @@ impl AiAgent {
         let response = match self.call_llm(&prompt).await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!("LLM API call failed: {:?}. Falling back to simulation.", e);
-                // If API fails, simulate a structured response
-                serde_json::to_string(&AgentDecision {
-                    reasoning: "Detected blockhash expiry before transaction landed. Network might be slightly congested. I need to refresh the blockhash to get 150 more slots of validity and slightly increase tip.".into(),
-                    root_cause: "expired_blockhash".into(),
-                    action: "refresh_blockhash".into(),
-                    new_tip_lamports: Some(failure_context.tip + 5000),
-                    wait_slots: Some(0),
-                })?
+                tracing::error!("LLM API call failed: {:?}. Aborting AI decision loop.", e);
+                return Err(anyhow::anyhow!("LLM API failed, cannot reason about failure: {:?}", e));
             }
         };
 

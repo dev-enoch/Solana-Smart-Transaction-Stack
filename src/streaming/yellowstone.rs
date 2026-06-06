@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use std::time::Duration;
@@ -56,6 +56,7 @@ impl tonic::codec::Decoder for YellowstoneDecoder {
     }
 }
 
+#[derive(Clone)]
 pub struct YellowstoneStreamer {
     endpoint: String,
     x_token: Option<String>,
@@ -63,6 +64,7 @@ pub struct YellowstoneStreamer {
     rpc_client: Arc<RpcClient>,
     leader_schedule: Arc<RwLock<HashMap<u64, String>>>,
     payer_pubkey: String,
+    jito_validators: HashSet<String>,
 }
 
 impl YellowstoneStreamer {
@@ -72,6 +74,7 @@ impl YellowstoneStreamer {
         event_tx: tokio::sync::mpsc::Sender<StreamEvent>,
         rpc_url: &str,
         payer_pubkey: String,
+        jito_validators: HashSet<String>,
     ) -> Result<Self> {
         let rpc_client = Arc::new(solana_client::rpc_client::RpcClient::new(rpc_url.to_string()));
         Ok(Self {
@@ -81,6 +84,7 @@ impl YellowstoneStreamer {
             rpc_client,
             leader_schedule: Arc::new(RwLock::new(HashMap::new())),
             payer_pubkey,
+            jito_validators,
         })
     }
 
@@ -209,11 +213,30 @@ impl YellowstoneStreamer {
         }
     }
 
-    pub fn is_optimal_submission_window(&self, _current_slot: u64, _target_leader: &str) -> bool {
+    pub async fn is_optimal_submission_window(&self, current_slot: u64) -> bool {
+        let schedule = self.leader_schedule.read().await;
+        // Look ahead next 4 slots
+        for i in 0..=4 {
+            if let Some(leader) = schedule.get(&(current_slot + i)) {
+                if self.jito_validators.contains(leader) {
+                    return true;
+                }
+            }
+        }
         false
     }
 
-    pub fn get_next_leader_window(&self) -> Option<u64> {
+    pub async fn get_next_leader_window(&self, current_slot: u64) -> Option<u64> {
+        let schedule = self.leader_schedule.read().await;
+        // Look ahead up to 400 slots (1 epoch)
+        for i in 0..400 {
+            let slot = current_slot + i;
+            if let Some(leader) = schedule.get(&slot) {
+                if self.jito_validators.contains(leader) {
+                    return Some(slot);
+                }
+            }
+        }
         None
     }
 }
