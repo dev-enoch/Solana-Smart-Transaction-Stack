@@ -1,0 +1,28 @@
+[package]
+name = "solana-smart-tx-stack-rs"
+version = "0.1.0"
+edition = "2021"
+default-run = "solana-smart-tx-stack-rs"
+
+[dependencies]
+solana-sdk = "~1.18"
+solana-client = "~1.18"
+solana-program = "~1.18"
+spl-memo = "4.0.0"
+
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+dotenv = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+yellowstone-grpc-proto = { version = "11", default-features = false }
+bs58 = "0.5.1"
+bincode = "1.3"
+tonic = { version = "0.10.2", features = ["tls-roots"] }
+tokio-stream = "0.1.15"
+async-stream = "0.3.6"
