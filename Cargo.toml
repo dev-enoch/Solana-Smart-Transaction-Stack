@@ -23,6 +23,7 @@ chrono = { version = "0.4", features = ["serde"] }
 yellowstone-grpc-proto = { version = "11", default-features = false }
 bs58 = "0.5.1"
 bincode = "1.3"
+solana-transaction-status = "~1.18"
 tonic = { version = "0.10.2", features = ["tls-roots"] }
 tokio-stream = "0.1.15"
 async-stream = "0.3.6"

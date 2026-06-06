@@ -13,7 +13,7 @@ use yellowstone_grpc_proto::prelude::{
 };
 
 use crate::types::streaming::{SlotUpdate, StreamEvent, TransactionUpdate};
-use solana_client::rpc_client::RpcClient;
+use solana_client::nonblocking::rpc_client::RpcClient;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::client::Grpc;
@@ -76,7 +76,7 @@ impl YellowstoneStreamer {
         payer_pubkey: String,
         jito_validators: HashSet<String>,
     ) -> Result<Self> {
-        let rpc_client = Arc::new(solana_client::rpc_client::RpcClient::new(rpc_url.to_string()));
+        let rpc_client = Arc::new(RpcClient::new(rpc_url.to_string()));
         Ok(Self {
             endpoint: endpoint.to_string(),
             x_token,
@@ -89,7 +89,7 @@ impl YellowstoneStreamer {
     }
 
     pub async fn update_leader_schedule(&self, start_slot: u64) -> Result<()> {
-        let leaders = self.rpc_client.get_slot_leaders(start_slot, 100)?;
+        let leaders = self.rpc_client.get_slot_leaders(start_slot, 100).await?;
         let mut schedule = self.leader_schedule.write().await;
         for (i, leader) in leaders.iter().enumerate() {
             schedule.insert(start_slot + i as u64, leader.to_string());

@@ -8,6 +8,7 @@ use solana_sdk::{
 use std::sync::Arc;
 use tracing::info;
 use reqwest::Client;
+use solana_client::nonblocking::rpc_client::RpcClient;
 
 use crate::core::tip::TipManager;
 
@@ -16,7 +17,7 @@ pub struct BundleBuilder {
     jito_url: String,
     payer: Arc<Keypair>,
     tip_manager: TipManager,
-    rpc_client: Arc<solana_client::rpc_client::RpcClient>,
+    rpc_client: Arc<RpcClient>,
     http_client: Client,
 }
 
@@ -26,65 +27,86 @@ impl BundleBuilder {
             jito_url: jito_url.to_string(),
             payer: Arc::new(payer),
             tip_manager,
-            rpc_client: Arc::new(solana_client::rpc_client::RpcClient::new(rpc_url.to_string())),
+            rpc_client: Arc::new(RpcClient::new(rpc_url.to_string())),
             http_client: Client::new(),
         }
     }
 
+    /// Build and submit a Jito bundle with dynamic or AI-overridden tip.
     pub async fn build_and_submit(
         &self,
         mut transactions: Vec<VersionedTransaction>,
         slot: u64,
-    ) -> Result<(String, Vec<String>, u64)> {  
-        let tip_account = self.tip_manager.get_tip_accounts().await?.first().cloned().unwrap();
-        let tip_lamports = self.tip_manager.calculate_dynamic_tip(10_000, 1.5).await?; 
+        override_tip: Option<u64>,
+    ) -> Result<(String, Vec<String>, u64, u64)> {
+        let tip_account = self
+            .tip_manager
+            .get_tip_accounts()
+            .await?
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow!("No tip accounts available"))?;
 
-        info!("Building real tip transaction of {} lamports to {}", tip_lamports, tip_account);
+        // Use AI-recommended tip if provided, otherwise calculate dynamically
+        let tip_lamports = match override_tip {
+            Some(tip) => {
+                info!("Using AI-overridden tip: {} lamports", tip);
+                tip
+            }
+            None => self.tip_manager.calculate_dynamic_tip(10_000, 1.5).await?,
+        };
 
-        // Fetch real blockhash and last_valid_block_height
-        let (blockhash, last_valid_block_height) = self.rpc_client.get_latest_blockhash_with_commitment(solana_sdk::commitment_config::CommitmentConfig::confirmed())
+        info!(
+            "Building tip transaction: {} lamports to {}",
+            tip_lamports, tip_account
+        );
+
+        // Fetch fresh blockhash with confirmed commitment for maximum validity window.
+        let (blockhash, last_valid_block_height) = self
+            .rpc_client
+            .get_latest_blockhash_with_commitment(
+                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+            )
+            .await
             .map_err(|e| anyhow!("Failed to get latest blockhash: {}", e))?;
 
-        // Create tip instruction
-        let tip_ix = system_instruction::transfer(
-            &self.payer.pubkey(),
-            &tip_account,
-            tip_lamports,
-        );
+        // Build the tip transaction
+        let tip_ix = system_instruction::transfer(&self.payer.pubkey(), &tip_account, tip_lamports);
 
         let msg = Message::new(&[tip_ix], Some(&self.payer.pubkey()));
         let mut tx = Transaction::new_unsigned(msg);
         tx.sign(&[&*self.payer], blockhash);
-        
+
         let versioned_tx = VersionedTransaction::from(tx);
         transactions.push(versioned_tx);
 
-        info!("Constructing Jito bundle with {} transactions...", transactions.len());
+        info!(
+            "Constructing Jito bundle with {} transactions...",
+            transactions.len()
+        );
 
+        // Serialize and encode all transactions
         let mut encoded_txs = Vec::new();
         let mut signatures = Vec::new();
         for tx in transactions {
             if let Some(sig) = tx.signatures.first() {
                 signatures.push(sig.to_string());
             }
-            let serialized = bincode::serialize(&tx).map_err(|e| anyhow!("Bincode error: {}", e))?;
+            let serialized =
+                bincode::serialize(&tx).map_err(|e| anyhow!("Bincode serialization error: {}", e))?;
             encoded_txs.push(bs58::encode(serialized).into_string());
         }
 
+        // Submit bundle to Jito Block Engine via sendBundle JSON-RPC
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "sendBundle",
-            "params": [
-                encoded_txs
-            ]
+            "params": [encoded_txs]
         });
 
         let endpoint = format!("{}/api/v1/bundles", self.jito_url);
-        let res = self.http_client.post(&endpoint)
-            .json(&payload)
-            .send()
-            .await?;
+        let res = self.http_client.post(&endpoint).json(&payload).send().await?;
 
         if !res.status().is_success() {
             let err_text = res.text().await?;
@@ -92,7 +114,7 @@ impl BundleBuilder {
         }
 
         let resp_json: serde_json::Value = res.json().await?;
-        
+
         if let Some(err) = resp_json.get("error") {
             anyhow::bail!("Bundle submission error: {}", err);
         }
@@ -102,8 +124,11 @@ impl BundleBuilder {
             .unwrap_or("unknown_id")
             .to_string();
 
-        info!("Bundle submitted successfully! ID: {} at slot {}", bundle_id, slot);
+        info!(
+            "Bundle submitted! ID: {} at slot {} (tip: {} lamports)",
+            bundle_id, slot, tip_lamports
+        );
 
-        Ok((bundle_id, signatures, last_valid_block_height))
+        Ok((bundle_id, signatures, last_valid_block_height, tip_lamports))
     }
 }
