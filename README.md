@@ -16,7 +16,7 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
 1. **Clone and Install Dependencies**
    Ensure you have Rust and Cargo installed.
    ```bash
-   git clone <repo_url>
+   git clone https://github.com/dev-enoch/Solana-Smart-Transaction-Stack.git
    cd solana-smart-tx-stack-rs
    ```
 
