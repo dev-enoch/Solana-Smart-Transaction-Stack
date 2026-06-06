@@ -42,13 +42,32 @@ async fn main() -> Result<()> {
     info!("====== Starting solana-smart-tx-stack-rs ======");
 
 
-    let endpoint = std::env::var("YELLOWSTONE_ENDPOINT")
+    let network = std::env::var("NETWORK")
+        .unwrap_or_else(|_| "devnet".to_string())
+        .to_lowercase();
+    let prefix = if network == "mainnet" { "MAINNET_" } else { "DEVNET_" };
+
+    let endpoint = std::env::var(format!("{}YELLOWSTONE_ENDPOINT", prefix))
+        .or_else(|_| std::env::var("YELLOWSTONE_ENDPOINT"))
         .unwrap_or_else(|_| "http://localhost:50051".to_string());
-    let x_token = std::env::var("YELLOWSTONE_X_TOKEN").ok();
-    let jito_url = std::env::var("JITO_BLOCK_ENGINE_URL")
+    
+    let x_token = std::env::var(format!("{}YELLOWSTONE_X_TOKEN", prefix))
+        .or_else(|_| std::env::var("YELLOWSTONE_X_TOKEN"))
+        .ok();
+
+    let jito_url = std::env::var(format!("{}JITO_BLOCK_ENGINE_URL", prefix))
+        .or_else(|_| std::env::var("JITO_BLOCK_ENGINE_URL"))
         .unwrap_or_else(|_| "https://amsterdam.mainnet.block-engine.jito.wtf".to_string());
-    let rpc_url = std::env::var("RPC_URL")
-        .unwrap_or_else(|_| "https://api.devnet.solana.com".to_string());
+
+    let rpc_url = std::env::var(format!("{}RPC_URL", prefix))
+        .or_else(|_| std::env::var("RPC_URL"))
+        .unwrap_or_else(|_| {
+            if network == "mainnet" {
+                "https://api.mainnet-beta.solana.com".to_string()
+            } else {
+                "https://api.devnet.solana.com".to_string()
+            }
+        });
     let jito_validators_str = std::env::var("JITO_VALIDATORS").unwrap_or_default();
     let jito_validators: std::collections::HashSet<String> = jito_validators_str
         .split(',')

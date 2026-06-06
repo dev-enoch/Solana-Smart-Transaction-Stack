@@ -43,7 +43,14 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
    cp .env.example .env
    ```
 
-   _Note: You need a Yellowstone gRPC endpoint, a Solana RPC endpoint, and a valid LLM API key (supports Google Gemini, xAI/Grok, OpenAI, Groq, and any OpenAI-compatible API)._
+   **Where to get environment values:**
+   - `NETWORK`: Set to `mainnet` or `devnet` to toggle your environment. The stack will use the corresponding `MAINNET_` or `DEVNET_` prefixed URLs.
+   - `RPC_URL`: Get a Solana RPC endpoint from providers like [Helius](https://helius.dev), [QuickNode](https://quicknode.com), [Alchemy](https://alchemy.com), or [Triton](https://triton.one).
+   - `YELLOWSTONE_ENDPOINT` & `X_TOKEN`: You need a Geyser/Yellowstone gRPC provider. Available via [Triton](https://triton.one), [Helius](https://helius.dev), or by running your own node with the Yellowstone Geyser plugin.
+   - `JITO_BLOCK_ENGINE_URL`: Standard Jito endpoints (e.g. `amsterdam.mainnet.block-engine.jito.wtf`). Check the [Jito Docs](https://jito-foundation.gitbook.io/mev) for regional URLs.
+   - `JITO_VALIDATORS`: Real Jito validator identity pubkeys. You can query the Jito API or block explorers to find active Jito validators.
+   - `PRIVATE_KEY`: Generate a testing keypair via `cargo run --bin keygen` (devnet funded) or export a byte array from Phantom/Solflare for mainnet testing. Ensure the wallet has SOL on the network you intend to test.
+   - `AI_API_KEY`: Get an API key from [xAI](https://console.x.ai), [Google AI Studio](https://aistudio.google.com), or [OpenAI](https://platform.openai.com).
 
 3. **Generate a Keypair (if needed)**
    ```bash
