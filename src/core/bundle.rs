@@ -53,7 +53,7 @@ impl BundleBuilder {
                 info!("Using AI-overridden tip: {} lamports", tip);
                 tip
             }
-            None => self.tip_manager.calculate_dynamic_tip(10_000, 1.5).await?,
+            None => self.tip_manager.calculate_dynamic_tip(100_000, 1.5).await?,
         };
 
         info!(

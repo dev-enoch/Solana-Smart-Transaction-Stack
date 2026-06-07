@@ -75,12 +75,12 @@ async fn main() -> Result<()> {
         .map(|s| s.to_string())
         .collect();
     let ai_api_url = std::env::var("AI_API_URL")
-        .unwrap_or_else(|_| "https://api.x.ai/v1/chat/completions".to_string());
+        .unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent".to_string());
     let ai_api_key = std::env::var("AI_API_KEY")
-        .or_else(|_| std::env::var("XAI_API_KEY"))
+        .or_else(|_| std::env::var("GEMINI_API_KEY"))
         .unwrap_or_default();
     let ai_model = std::env::var("AI_MODEL")
-        .unwrap_or_else(|_| "grok-3".to_string());
+        .unwrap_or_else(|_| "gemini-2.5-flash".to_string());
 
 
     let payer = if let Ok(key_str) = std::env::var("PRIVATE_KEY") {
@@ -97,8 +97,10 @@ async fn main() -> Result<()> {
 
 
     // Single shared RPC client used by all components
+    info!("Initializing RPC client: {}", rpc_url);
     let rpc_client = Arc::new(RpcClient::new(rpc_url.clone()));
 
+    info!("Starting TipManager with Jito Block Engine: {}", jito_url);
     let tip_manager = TipManager::new(rpc_client.clone(), &jito_url);
 
     let payer_bytes = payer.to_bytes();
@@ -110,6 +112,7 @@ async fn main() -> Result<()> {
         rpc_client.clone(),
     ));
 
+    info!("Initializing LifecycleTracker and AI Agent");
     let tracker = Arc::new(LifecycleTracker::new(
         "lifecycle_logs.json",
         logger.clone(),
@@ -210,6 +213,7 @@ async fn main() -> Result<()> {
 
 
     info!("Entering main event loop...");
+    let mut last_submission = tokio::time::Instant::now() - std::time::Duration::from_secs(5);
 
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -456,7 +460,12 @@ async fn main() -> Result<()> {
                     }
 
                     if should_submit {
+                        if last_submission.elapsed() < std::time::Duration::from_secs(2) {
+                            // Hit Jito rate limit (1 req/s). Wait.
+                            continue;
+                        }
                         let intent = queue.pop_front().unwrap();
+                        last_submission = tokio::time::Instant::now();
                         drop(queue); // Release lock before async work
 
                         info!(
@@ -465,8 +474,8 @@ async fn main() -> Result<()> {
                         );
 
                         // Fetch fresh blockhash using async RPC
-                        let blockhash = match rpc_client.get_latest_blockhash().await {
-                            Ok(bh) => bh,
+                        let blockhash = match rpc_client.get_latest_blockhash_with_commitment(solana_sdk::commitment_config::CommitmentConfig::confirmed()).await {
+                            Ok(bh) => bh.0,
                             Err(e) => {
                                 tracing::error!("Failed to get blockhash: {:?}", e);
                                 // Put intent back at front of queue
@@ -494,6 +503,7 @@ async fn main() -> Result<()> {
                         let trk = tracker.clone();
                         let log = logger.clone();
                         let intent_clone = intent.clone();
+                        let q_clone = intent_queue.clone();
 
                         tokio::spawn(async move {
                             match builder_clone
@@ -545,11 +555,14 @@ async fn main() -> Result<()> {
                                     tracing::error!("Bundle submission failed: {:?}", e);
                                     log.log(&OperationalEvent::SubmissionError {
                                         timestamp: Utc::now(),
-                                        intent_id: intent_clone.id,
+                                        intent_id: intent_clone.id.clone(),
                                         error: format!("{:?}", e),
                                         slot: current_slot,
                                     })
                                     .await;
+                                    tracing::info!("Re-queueing intent {} due to Jito API error", intent_clone.id);
+                                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                    q_clone.lock().await.push_front(intent_clone);
                                 }
                             }
                         });

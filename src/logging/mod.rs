@@ -6,16 +6,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Structured operational events for audit logging.
-///
-/// Each event is serialized as a single JSON line (JSONL) to the operational log file.
-/// This provides a machine-parseable audit trail of all operational decisions,
-/// complementing the lifecycle_logs.json with real-time event data.
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event")]
 pub enum OperationalEvent {
     /// A bundle was successfully submitted to the Jito Block Engine.
     #[serde(rename = "bundle_submitted")]
     BundleSubmitted {
+
         timestamp: DateTime<Utc>,
         bundle_id: String,
         slot: u64,

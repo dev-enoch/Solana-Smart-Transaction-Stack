@@ -25,9 +25,23 @@ pub struct LifecycleTracker {
 
 impl LifecycleTracker {
     pub fn new(log_file: &str, logger: StructuredLogger, rpc_client: Arc<RpcClient>) -> Self {
+        let entries = DashMap::new();
+        let sig_to_bundle = DashMap::new();
+
+        if let Ok(content) = std::fs::read_to_string(log_file) {
+            if let Ok(loaded) = serde_json::from_str::<Vec<LifecycleEntry>>(&content) {
+                for entry in loaded {
+                    for sig in &entry.signatures {
+                        sig_to_bundle.insert(sig.clone(), entry.bundle_id.clone());
+                    }
+                    entries.insert(entry.bundle_id.clone(), entry);
+                }
+            }
+        }
+
         Self {
-            entries: Arc::new(DashMap::new()),
-            sig_to_bundle: Arc::new(DashMap::new()),
+            entries: Arc::new(entries),
+            sig_to_bundle: Arc::new(sig_to_bundle),
             log_file: log_file.to_string(),
             logger,
             rpc_client,
@@ -249,7 +263,8 @@ impl LifecycleTracker {
             let bid = entry.key().clone();
             if entry.status == "pending" {
                 if let Some(lvbh) = entry.last_valid_block_height {
-                    if current_slot > lvbh {
+                    // Approximation: blockhash is valid for ~150 slots
+                    if current_slot > entry.slot_submitted + 150 {
                         entry.status = "failed".to_string();
                         entry.failure_type = Some("expired_blockhash".to_string());
                         let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
