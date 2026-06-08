@@ -7,7 +7,7 @@ use tempfile::NamedTempFile;
 #[tokio::test]
 async fn test_classify_failure() {
     assert_eq!(
-        LifecycleTracker::classify_failure("bundle contains an expired blockhash"),
+        LifecycleTracker::classify_failure("Transaction simulation failed: Blockhash not found"),
         "expired_blockhash"
     );
     assert_eq!(
@@ -15,16 +15,16 @@ async fn test_classify_failure() {
         "expired_blockhash"
     );
     assert_eq!(
-        LifecycleTracker::classify_failure("Transaction leaves an account with a lower balance than rent-exempt minimum"),
+        LifecycleTracker::classify_failure("Transfer: insufficient lamports 10000, need 150000"),
         "insufficient_funds"
     );
     assert_eq!(
-        LifecycleTracker::classify_failure("exceeded CUs meter"),
+        LifecycleTracker::classify_failure("Program Error: computational budget exceeded"),
         "compute_exceeded"
     );
     assert_eq!(
         LifecycleTracker::classify_failure("Some random unexpected error"),
-        "unknown_error"
+        "transaction_error"
     );
 }
 
@@ -34,7 +34,7 @@ async fn test_record_submission_and_expiry() {
     let file_path = temp_file.path().to_str().unwrap();
     
     // Create a dummy logger
-    let logger = StructuredLogger::new("dummy_events.jsonl");
+    let logger = StructuredLogger::new("dummy_events.jsonl").unwrap();
     let rpc_client = Arc::new(RpcClient::new("http://localhost:8899".to_string()));
     
     let tracker = LifecycleTracker::new(file_path, logger, rpc_client);
