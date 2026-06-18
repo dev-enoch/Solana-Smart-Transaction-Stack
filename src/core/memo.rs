@@ -27,15 +27,12 @@ pub fn create_memo_tx(
         vec![AccountMeta::new(payer.pubkey(), true)],
     )];
 
-    // Determine the blockhash to use — stale for fault injection, fresh otherwise.
     let blockhash = match fault_injection.as_deref() {
         Some("expired_blockhash") => {
-            // Use the all-zero hash which is guaranteed to be expired.
             tracing::warn!("FAULT INJECTION: Using deliberately expired blockhash (Hash::default)");
             Hash::default()
         }
         Some("compute_exceeded") => {
-            // Set CU limit to 1 — the memo instruction requires more than 1 CU,
             tracing::warn!("FAULT INJECTION: Setting compute unit limit to 1");
             instructions.push(
                 solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1),
