@@ -19,7 +19,7 @@ use chrono::Utc;
 
 /// Maximum number of slots to wait for a Jito leader window before submitting anyway.
 /// Prevents queue starvation when Jito validators are not in the upcoming schedule.
-const MAX_WAIT_SLOTS: u64 = 100;
+const MAX_WAIT_SLOTS: u64 = 1;
 
 #[derive(Debug, Clone)]
 struct Intent {
@@ -520,17 +520,6 @@ async fn main() -> Result<()> {
                                     mut last_valid_block_height,
                                     actual_tip,
                                 )) => {
-                                    // Fault injection: set artificially short expiry
-                                    // to test the AI failure recovery pipeline
-                                    if intent_clone.fault_inject_early_expiry {
-                                        info!(
-                                            "⚠ Fault injection: setting expiry to slot {} (current: {})",
-                                            current_slot + 5,
-                                            current_slot
-                                        );
-                                        last_valid_block_height = current_slot + 5;
-                                    }
-
                                     trk.record_submission(
                                         bundle_id.clone(),
                                         current_slot,
@@ -540,6 +529,8 @@ async fn main() -> Result<()> {
                                         intent_clone.retries,
                                     )
                                     .await;
+
+
 
                                     log.log(&OperationalEvent::BundleSubmitted {
                                         timestamp: Utc::now(),
