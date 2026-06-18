@@ -18,7 +18,6 @@ use tokio::sync::Mutex;
 use chrono::Utc;
 
 /// Maximum number of slots to wait for a Jito leader window before submitting anyway.
-/// Prevents queue starvation when Jito validators are not in the upcoming schedule.
 const MAX_WAIT_SLOTS: u64 = 5;
 
 #[derive(Debug, Clone)]
@@ -596,8 +595,6 @@ async fn main() -> Result<()> {
             }
             StreamEvent::Transaction(tx_update) => {
                 // Stream delivers processed-level notifications.
-                // Confirmed and finalized are tracked by the commitment poller
-                // and the signature status polling task.
                 if let Some(ref error_msg) = tx_update.error {
                     // Classify the failure type from the error message
                     tracker

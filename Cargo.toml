@@ -3,6 +3,7 @@ name = "solana-smart-tx-stack-rs"
 version = "0.1.0"
 edition = "2021"
 default-run = "solana-smart-tx-stack-rs"
+description = "Production-grade Solana transaction infrastructure: Yellowstone gRPC, Jito bundles, lifecycle tracking, AI-driven failure recovery"
 
 [dependencies]
 solana-sdk = "~1.18"
@@ -28,6 +29,7 @@ tonic = { version = "0.10.2", features = ["tls-roots"] }
 tokio-stream = "0.1.15"
 async-stream = "0.3.6"
 dashmap = "6.2.1"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3.27.0"

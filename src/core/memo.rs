@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use solana_sdk::{
+    hash::Hash,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
     signature::Keypair,
@@ -8,14 +9,15 @@ use solana_sdk::{
 };
 use std::str::FromStr;
 
-// Memo Program ID (v2)
+/// Memo Program v2 ID.
 const MEMO_PROGRAM_ID: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
+/// Creates a memo transaction for inclusion in a Jito bundle.
 pub fn create_memo_tx(
     payer: &Keypair,
     message: &str,
-    recent_blockhash: &solana_sdk::hash::Hash,
-    tip_ix: Option<Instruction>,   // for the last tx in bundle
+    recent_blockhash: &Hash,
+    tip_ix: Option<Instruction>,
     fault_injection: Option<String>,
 ) -> Result<VersionedTransaction> {
     let mut instructions = vec![Instruction::new_with_bytes(
@@ -25,11 +27,23 @@ pub fn create_memo_tx(
         vec![AccountMeta::new(payer.pubkey(), true)],
     )];
 
-    if let Some(fault) = fault_injection {
-        if fault == "compute_exceeded" {
-            instructions.push(solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1));
+    // Determine the blockhash to use — stale for fault injection, fresh otherwise.
+    let blockhash = match fault_injection.as_deref() {
+        Some("expired_blockhash") => {
+            // Use the all-zero hash which is guaranteed to be expired.
+            tracing::warn!("FAULT INJECTION: Using deliberately expired blockhash (Hash::default)");
+            Hash::default()
         }
-    }
+        Some("compute_exceeded") => {
+            // Set CU limit to 1 — the memo instruction requires more than 1 CU,
+            tracing::warn!("FAULT INJECTION: Setting compute unit limit to 1");
+            instructions.push(
+                solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1),
+            );
+            *recent_blockhash
+        }
+        _ => *recent_blockhash,
+    };
 
     if let Some(tip) = tip_ix {
         instructions.push(tip);
@@ -38,8 +52,8 @@ pub fn create_memo_tx(
     let msg = solana_sdk::message::v0::Message::try_compile(
         &payer.pubkey(),
         &instructions,
-        &[], // lookup tables
-        *recent_blockhash,
+        &[], // address lookup tables
+        blockhash,
     )
     .map_err(|e| anyhow!("Failed to compile memo message: {}", e))?;
 

@@ -5,21 +5,35 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Structured operational events for audit logging.
-
+/// Structured operational events for the JSONL audit log.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event")]
 pub enum OperationalEvent {
+    /// System startup with configuration summary.
+    #[serde(rename = "system_startup")]
+    SystemStartup {
+        timestamp: DateTime<Utc>,
+        network: String,
+        rpc_url: String,
+        jito_url: String,
+        yellowstone_endpoint: String,
+        ai_primary_provider: String,
+        ai_fallback_provider: Option<String>,
+        payer_pubkey: String,
+        jito_validator_count: usize,
+    },
+
     /// A bundle was successfully submitted to the Jito Block Engine.
     #[serde(rename = "bundle_submitted")]
     BundleSubmitted {
-
         timestamp: DateTime<Utc>,
         bundle_id: String,
         slot: u64,
+        block_height: Option<u64>,
         tip_lamports: u64,
         signatures: Vec<String>,
         memo: String,
+        fault_injection: Option<String>,
     },
 
     /// A transaction commitment level was observed (processed/confirmed/finalized).
@@ -52,6 +66,8 @@ pub enum OperationalEvent {
         root_cause: String,
         new_tip: Option<u64>,
         wait_slots: Option<u64>,
+        confidence: Option<f64>,
+        provider: String,
     },
 
     /// A dynamic tip was calculated from network data.
@@ -62,6 +78,7 @@ pub enum OperationalEvent {
         congestion_factor: f64,
         result_lamports: u64,
         recent_fee_count: usize,
+        p75_fee: Option<u64>,
         avg_tip_account_balance_lamports: Option<u64>,
     },
 
@@ -88,6 +105,7 @@ pub enum OperationalEvent {
         timestamp: DateTime<Utc>,
         endpoint: String,
         backoff_secs: u64,
+        reconnection_count: u64,
     },
 
     /// A slot was observed from the stream (sampled — not every slot is logged).
@@ -95,6 +113,7 @@ pub enum OperationalEvent {
     SlotObserved {
         timestamp: DateTime<Utc>,
         slot: u64,
+        block_height: Option<u64>,
         leader: Option<String>,
         is_jito_window: bool,
     },
@@ -107,17 +126,29 @@ pub enum OperationalEvent {
         error: String,
         slot: u64,
     },
+
+    /// Bundle status retrieved from Jito's getBundleStatuses API.
+    #[serde(rename = "bundle_status_update")]
+    BundleStatusUpdate {
+        timestamp: DateTime<Utc>,
+        bundle_id: String,
+        status: String,
+        landed_slot: Option<u64>,
+    },
+
+    /// Stream health metrics report (emitted periodically).
+    #[serde(rename = "stream_health")]
+    StreamHealth {
+        timestamp: DateTime<Utc>,
+        messages_per_sec: f64,
+        total_slot_updates: u64,
+        total_tx_updates: u64,
+        messages_dropped: u64,
+        reconnection_count: u64,
+    },
 }
 
 /// Append-only structured JSON logger for operational events.
-///
-/// Writes each event as a single JSON line (JSONL format) to the log file.
-/// This provides a machine-parseable audit trail that judges can review
-/// alongside the lifecycle_logs.json for full operational visibility.
-///
-/// Two logging layers work together:
-/// - `tracing` → console output (human-readable, real-time)
-/// - `StructuredLogger` → file output (machine-readable JSONL, persistent)
 #[derive(Clone)]
 pub struct StructuredLogger {
     file: Arc<Mutex<File>>,
@@ -125,20 +156,14 @@ pub struct StructuredLogger {
 
 impl StructuredLogger {
     /// Create a new structured logger that appends to the given file path.
-    /// Creates the file if it doesn't exist.
     pub fn new(path: &str) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
         })
     }
 
     /// Log a single operational event as a JSON line.
-    /// Each line is flushed immediately to ensure events are persisted
-    /// even if the process crashes.
     pub async fn log(&self, event: &OperationalEvent) {
         match serde_json::to_string(event) {
             Ok(json) => {

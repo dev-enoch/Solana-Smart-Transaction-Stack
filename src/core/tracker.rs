@@ -1,14 +1,14 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::sync::Arc;
 use dashmap::DashMap;
-use tracing::{info, warn};
-
-use crate::types::lifecycle::LifecycleEntry;
-use crate::logging::{StructuredLogger, OperationalEvent};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::logging::{OperationalEvent, StructuredLogger};
+use crate::types::lifecycle::LifecycleEntry;
 
 /// Maximum number of retries before a bundle chain is abandoned.
 pub const MAX_RETRIES: u32 = 3;
@@ -21,6 +21,8 @@ pub struct LifecycleTracker {
     log_file: String,
     logger: StructuredLogger,
     rpc_client: Arc<RpcClient>,
+    /// Cache of recent block times to avoid per-update RPC calls.
+    block_time_cache: Arc<DashMap<u64, i64>>,
 }
 
 impl LifecycleTracker {
@@ -28,6 +30,7 @@ impl LifecycleTracker {
         let entries = DashMap::new();
         let sig_to_bundle = DashMap::new();
 
+        // Load existing lifecycle entries from disk if available.
         if let Ok(content) = std::fs::read_to_string(log_file) {
             if let Ok(loaded) = serde_json::from_str::<Vec<LifecycleEntry>>(&content) {
                 for entry in loaded {
@@ -45,6 +48,7 @@ impl LifecycleTracker {
             log_file: log_file.to_string(),
             logger,
             rpc_client,
+            block_time_cache: Arc::new(DashMap::new()),
         }
     }
 
@@ -59,11 +63,13 @@ impl LifecycleTracker {
         last_valid_block_height: u64,
         retry_count: u32,
         history_summary: String,
+        block_height: Option<u64>,
     ) {
         let entry = LifecycleEntry {
             intent_id,
             bundle_id: bundle_id.clone(),
             slot_submitted: slot,
+            block_height_submitted: block_height,
             submitted_at: Utc::now(),
             tip_lamports: tip,
             last_valid_block_height: Some(last_valid_block_height),
@@ -93,33 +99,62 @@ impl LifecycleTracker {
     /// Classify a transaction error string into a failure category.
     pub fn classify_failure(error: &str) -> String {
         let lower = error.to_lowercase();
-        if lower.contains("blockhashnotfound") || lower.contains("blockhash not found") {
+        if lower.contains("blockhashnotfound")
+            || lower.contains("blockhash not found")
+            || lower.contains("blockhash expired")
+        {
             "expired_blockhash".to_string()
-        } else if lower.contains("insufficientfunds") || lower.contains("insufficient funds")
+        } else if lower.contains("insufficientfunds")
+            || lower.contains("insufficient funds")
             || lower.contains("insufficient lamports")
         {
             "insufficient_funds".to_string()
         } else if lower.contains("computationalbudgetexceeded")
             || lower.contains("computational budget exceeded")
-            || lower.contains("exceeded CUs meter")
+            || lower.contains("exceeded cus meter")
+            || lower.contains("exceeded compute")
         {
             "compute_exceeded".to_string()
         } else if lower.contains("alreadyprocessed") || lower.contains("already processed") {
             "already_processed".to_string()
-        } else if lower.contains("bundle") {
+        } else if lower.contains("bundle") || lower.contains("bundledrop") {
             "bundle_failure".to_string()
+        } else if lower.contains("fee") && (lower.contains("too low") || lower.contains("insufficient")) {
+            "fee_too_low".to_string()
         } else {
             "transaction_error".to_string()
         }
     }
 
+    /// Get a cached or fetched block time for a given slot.
+    async fn get_block_time_cached(&self, slot: u64) -> i64 {
+        // Check cache first
+        if let Some(cached) = self.block_time_cache.get(&slot) {
+            return *cached;
+        }
+
+        // Fetch from RPC
+        match self.rpc_client.get_block_time(slot).await {
+            Ok(ts) => {
+                // Cache the result (limit cache size to prevent unbounded growth)
+                if self.block_time_cache.len() > 1000 {
+                    // Remove oldest entries (rough eviction)
+                    let keys: Vec<u64> = self.block_time_cache.iter().take(200).map(|e| *e.key()).collect();
+                    for k in keys {
+                        self.block_time_cache.remove(&k);
+                    }
+                }
+                self.block_time_cache.insert(slot, ts);
+                ts
+            }
+            Err(_) => Utc::now().timestamp(),
+        }
+    }
+
     /// Update the commitment status of a bundle.
     pub async fn update_status(&self, bundle_id: &str, commitment: &str, slot: u64) {
-        // Fetch real block time for accurate latency, fallback to slot approximation
-        let block_time_sec = self.rpc_client.get_block_time(slot).await.unwrap_or_else(|_| {
-            let now = Utc::now().timestamp();
-            now
-        });
+        // Fetch block time with caching
+        let block_time_sec = self.get_block_time_cached(slot).await;
 
         let event = {
             let mut entry = match self.entries.get_mut(bundle_id) {
@@ -127,15 +162,20 @@ impl LifecycleTracker {
                 None => return,
             };
 
+            // Don't update failed bundles (unless marking as failed)
             if entry.status == "failed" && commitment != "failed" {
                 return;
             }
 
             // Real timestamp from the network block time
-            let real_timestamp = chrono::DateTime::from_timestamp(block_time_sec, 0).unwrap_or(Utc::now());
+            let real_timestamp =
+                chrono::DateTime::from_timestamp(block_time_sec, 0).unwrap_or(Utc::now());
             // Ensure timestamp is not before submitted_at
             let ts = if real_timestamp < entry.submitted_at {
-                entry.submitted_at + chrono::Duration::milliseconds((slot.saturating_sub(entry.slot_submitted)) as i64 * 400)
+                entry.submitted_at
+                    + chrono::Duration::milliseconds(
+                        (slot.saturating_sub(entry.slot_submitted)) as i64 * 400,
+                    )
             } else {
                 real_timestamp
             };
@@ -160,8 +200,15 @@ impl LifecycleTracker {
                 "confirmed" if entry.confirmed_at.is_none() => {
                     entry.confirmed_at = Some(ts);
                     entry.confirmed_slot = Some(slot);
-                    let lat = (ts - entry.submitted_at).num_milliseconds();
-                    entry.latency_confirmed_ms = Some(lat);
+                    let lat_from_submitted = (ts - entry.submitted_at).num_milliseconds();
+                    entry.latency_confirmed_ms = Some(lat_from_submitted);
+
+                    // Calculate the critical processed→confirmed delta
+                    if let Some(proc_at) = entry.processed_at {
+                        let delta = (ts - proc_at).num_milliseconds();
+                        entry.latency_processed_to_confirmed_ms = Some(delta);
+                    }
+
                     if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
                         entry.status = "confirmed".to_string();
                     }
@@ -170,7 +217,7 @@ impl LifecycleTracker {
                         bundle_id: bundle_id.to_string(),
                         commitment: "confirmed".to_string(),
                         slot,
-                        latency_ms: Some(lat),
+                        latency_ms: Some(lat_from_submitted),
                     })
                 }
                 "finalized" if entry.finalized_at.is_none() => {
@@ -206,10 +253,23 @@ impl LifecycleTracker {
         if let Some(ref evt) = event {
             self.logger.log(evt).await;
             match evt {
-                OperationalEvent::CommitmentUpdate { bundle_id, commitment, slot, latency_ms, .. } => {
-                    info!("Commitment: {} → {} at slot {} (latency: {:?}ms)", bundle_id, commitment, slot, latency_ms);
+                OperationalEvent::CommitmentUpdate {
+                    bundle_id,
+                    commitment,
+                    slot,
+                    latency_ms,
+                    ..
+                } => {
+                    info!(
+                        "Commitment: {} → {} at slot {} (latency: {:?}ms)",
+                        bundle_id, commitment, slot, latency_ms
+                    );
                 }
-                OperationalEvent::FailureDetected { bundle_id, failure_type, .. } => {
+                OperationalEvent::FailureDetected {
+                    bundle_id,
+                    failure_type,
+                    ..
+                } => {
                     warn!("Failure: {} — {}", bundle_id, failure_type);
                 }
                 _ => {}
@@ -271,18 +331,24 @@ impl LifecycleTracker {
         }
     }
 
-    pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, String, u64, u64, i64, u32, String)> {
+    /// Check for expired blockhashes using **block height** (NOT slot number).
+    pub async fn check_expiries(
+        &self,
+        current_block_height: u64,
+    ) -> Vec<(String, String, u64, u64, i64, u32, String)> {
         let mut expired = Vec::new();
         for mut entry in self.entries.iter_mut() {
             let bid = entry.key().clone();
             if entry.status == "pending" || entry.status == "processed" {
                 if let Some(lvbh) = entry.last_valid_block_height {
-                    // Use actual last_valid_block_height for expiry detection
-                    if current_slot > lvbh {
+                    if current_block_height > lvbh {
                         entry.status = "failed".to_string();
                         entry.failure_type = Some("expired_blockhash".to_string());
                         let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
-                        warn!("Blockhash expiry detected for bundle {}", bid);
+                        warn!(
+                            "Blockhash expiry detected for bundle {} (block_height {} > last_valid {})",
+                            bid, current_block_height, lvbh
+                        );
                         expired.push((
                             entry.intent_id.clone(),
                             bid,
@@ -299,60 +365,17 @@ impl LifecycleTracker {
         expired
     }
 
-    pub async fn advance_commitments_by_slot(&self, current_slot: u64, status: i32) {
-        let target_commitment = match status {
-            1 => "confirmed",
-            2 => "finalized",
-            _ => return,
-        };
-
-        let mut to_update = Vec::new();
-        {
-            for entry in self.entries.iter() {
-                let bid = entry.key().clone();
-                if entry.status == "failed" || entry.status == "finalized" {
-                    continue;
-                }
-
-                let processed_slot = match entry.processed_slot {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                if processed_slot > current_slot {
-                    continue;
-                }
-
-                match target_commitment {
-                    "confirmed" if entry.confirmed_at.is_none() => {
-                        to_update.push((bid, "confirmed"));
-                    }
-                    "finalized" => {
-                        if entry.confirmed_at.is_none() {
-                            to_update.push((bid.clone(), "confirmed"));
-                        }
-                        if entry.finalized_at.is_none() {
-                            to_update.push((bid, "finalized"));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } // Drop lock
-
-        for (bid, commitment) in to_update {
-            self.update_status(&bid, commitment, current_slot).await;
-        }
-    }
-
     /// Poll `getSignatureStatuses` for pending/processed bundles as secondary confirmation.
-    /// This supplements the gRPC stream with RPC-based verification.
     pub async fn poll_signature_statuses(&self) {
         // Collect signatures that still need confirmation
         let sigs_to_check: Vec<(String, String)> = {
             self.entries
                 .iter()
-                .filter(|e| e.status == "processed" || e.status == "confirmed")
+                .filter(|e| {
+                    e.status == "pending"
+                        || e.status == "processed"
+                        || e.status == "confirmed"
+                })
                 .flat_map(|e| {
                     e.signatures
                         .iter()
@@ -382,7 +405,6 @@ impl LifecycleTracker {
 
         let sig_refs: Vec<Signature> = parsed.iter().map(|(s, _)| *s).collect();
 
-        // Query confirmed status
         match self.rpc_client.get_signature_statuses(&sig_refs).await {
             Ok(response) => {
                 for (i, status_opt) in response.value.iter().enumerate() {
@@ -393,7 +415,8 @@ impl LifecycleTracker {
                                 .await;
                         } else if let Some(ref confirmation) = status.confirmation_status {
                             let commitment_str = format!("{:?}", confirmation).to_lowercase();
-                            self.update_status(bid, &commitment_str, status.slot).await;
+                            self.update_status(bid, &commitment_str, status.slot)
+                                .await;
                         }
                     }
                 }
@@ -411,5 +434,25 @@ impl LifecycleTracker {
         tokio::fs::write(&self.log_file, json).await?;
         info!("Lifecycle logs saved ({} entries)", values.len());
         Ok(())
+    }
+
+    /// Get summary statistics for logging/display.
+    pub async fn get_stats(&self) -> (usize, usize, usize, usize, usize) {
+        let mut pending = 0;
+        let mut processed = 0;
+        let mut confirmed = 0;
+        let mut finalized = 0;
+        let mut failed = 0;
+        for entry in self.entries.iter() {
+            match entry.status.as_str() {
+                "pending" => pending += 1,
+                "processed" => processed += 1,
+                "confirmed" => confirmed += 1,
+                "finalized" => finalized += 1,
+                "failed" => failed += 1,
+                _ => {}
+            }
+        }
+        (pending, processed, confirmed, finalized, failed)
     }
 }
