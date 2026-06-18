@@ -1,0 +1,211 @@
+Solana Smart Transaction Infrastructure Stack
+AI-Augmented Jito Bundle Submission, Lifecycle Tracking & Autonomous Failure Recovery
+Author:-
+Bounty: Superteam Nigeria – Solana Smart Transaction Infrastructure Challenge
+Date: June 2026
+1. Executive Summary
+Modern Solana applications require far more than simply submitting transactions through an RPC endpoint. Between transaction creation and finalization, transactions pass through multiple stages of the Solana network including leader scheduling, TPU ingestion, block production, shred propagation, and commitment confirmation. Production-grade infrastructure must understand these stages, react intelligently to failures, and adapt dynamically to changing network conditions.
+This project implements a complete smart transaction infrastructure stack that combines Yellowstone gRPC streaming, Jito bundle submission, lifecycle observability, and AI-powered operational decision making.
+The system continuously observes live network conditions using Yellowstone (Geyser) streams, identifies optimal leader windows for submission, dynamically calculates Jito tips based on real network fee data, submits transaction bundles through the Jito Block Engine, and tracks every transaction throughout its lifecycle from submission to finalization.
+In addition to monitoring and execution, the stack introduces an AI-powered operational layer capable of diagnosing transaction failures and making autonomous retry decisions. Rather than relying on hardcoded retry logic, the AI agent evaluates failure context, determines root causes, recommends corrective actions, and initiates recovery workflows when appropriate.
+The result is a transaction infrastructure platform that demonstrates how Solana transactions move through the network while satisfying all requirements of the Smart Transaction Infrastructure bounty.
+2. Requirements Coverage
+The table below maps each requirement to the implemented system component.
+Requirement
+Implementation
+Yellowstone Streaming
+Yellowstone Streamer
+Live Slot Monitoring
+Yellowstone Streamer
+Leader Schedule Detection
+Leader Schedule Cache
+Jito Bundle Submission
+Bundle Builder
+Dynamic Tip Calculation
+Tip Manager
+Commitment Tracking
+Lifecycle Tracker
+Failure Classification
+Lifecycle Tracker
+Autonomous Retry Logic
+AI Agent
+Blockhash Expiry Recovery
+AI Agent + Retry Pipeline
+Fault Injection
+Expired Blockhash Simulation
+Lifecycle Logging
+JSON Lifecycle Logs
+Real-Time Observability
+Yellowstone Subscriptions
+
+3. System Architecture Overview
+The transaction stack is organized into five primary layers:
+Ingestion Layer
+Core Transaction Engine
+Decision Layer
+Tracking and Observability Layer
+Submission Layer
+Each layer is responsible for a specific operational concern and communicates through asynchronous message passing using Tokio channels and shared state primitives.
+
+
+Architectural Layers
+Ingestion Layer
+Responsible for collecting real-time Solana network data through Yellowstone gRPC subscriptions.
+Primary responsibilities include:
+Slot streaming
+Transaction streaming
+Leader schedule tracking
+Reconnection management
+Backpressure handling
+Core Transaction Engine
+Responsible for transaction creation and bundle preparation.
+Primary responsibilities include:
+Memo transaction construction
+Dynamic tip calculation
+Blockhash management
+Bundle assembly
+Jito payload generation
+Decision Layer
+Responsible for intelligent operational decisions.
+Primary responsibilities include:
+Failure reasoning
+Retry strategy generation
+Tip adjustment recommendations
+Submission timing recommendations
+Tracking and Observability Layer
+Responsible for transaction lifecycle monitoring.
+Primary responsibilities include:
+Commitment tracking
+Latency measurement
+Failure classification
+Lifecycle persistence
+Operational telemetry
+Submission Layer
+Responsible for communication with the Jito Block Engine.
+Primary responsibilities include:
+Bundle serialization
+Bundle submission
+Bundle response handling
+Error propagation
+4. High-Level Architecture
+[Insert Architecture Diagram Here]
+The following workflow describes the interaction between all major components.
+Yellowstone continuously streams slot and transaction updates.
+The orchestrator processes stream events.
+The leader schedule cache determines whether a favorable Jito leader window is approaching.
+The Tip Manager calculates an optimal tip using live prioritization fee data.
+The Bundle Builder constructs a transaction bundle.
+The bundle is submitted to the Jito Block Engine.
+The Lifecycle Tracker monitors commitment progression.
+Failures are analyzed by the AI Agent.
+The AI Agent determines whether to retry, increase tips, refresh blockhashes, delay submission, or abort.
+This architecture ensures the system remains responsive to changing network conditions while maintaining complete visibility into transaction behavior.
+5. Core Components
+5.1 Yellowstone Streamer
+Purpose
+The Yellowstone Streamer serves as the real-time ingestion layer of the system.
+It maintains a persistent gRPC connection to a Yellowstone (Geyser) endpoint and streams live Solana network events.
+
+Responsibilities
+Subscribe to slot updates
+Subscribe to transaction updates
+Maintain leader schedule cache
+Detect upcoming Jito leaders
+Handle automatic reconnection
+Minimize bandwidth through account filtering
+Why Yellowstone?
+Traditional RPC polling introduces latency and unnecessary load.
+Yellowstone provides:
+Sub-second updates
+Lower latency
+Reduced network overhead
+Real-time transaction visibility
+Accurate slot progression monitoring
+This makes Yellowstone the preferred mechanism for timing-sensitive transaction infrastructure.
+5.2 Tip Manager
+Purpose
+The Tip Manager dynamically determines the optimal bundle tip required for successful transaction inclusion.
+Rather than relying on hardcoded tip values, the system continuously analyzes recent prioritization fee activity and adjusts bundle tips according to current network conditions.
+Responsibilities
+Fetch prioritization fee data
+Maintain recent fee history
+Calculate congestion-adjusted tips
+Prevent underbidding during congestion
+Prevent excessive overpayment during low traffic periods
+Dynamic Tip Strategy
+The system periodically collects recent prioritization fee data from the Solana network and calculates a competitive baseline.
+The final tip is determined using:
+Historical fee observations
+Current congestion multiplier
+Minimum tip floor
+This approach balances landing probability and operational cost.
+5.3 Bundle Builder
+Purpose
+The Bundle Builder constructs transaction bundles and submits them to the Jito Block Engine.
+Responsibilities
+Create bundle payloads
+Append tip transactions
+Sign transactions
+Serialize transactions
+Submit bundles through JSON-RPC
+Submission Workflow
+Obtain a fresh blockhash.
+Calculate the dynamic tip.
+Build memo transaction.
+Build tip transaction.
+Assemble bundle.
+Serialize transactions.
+Submit bundle to Jito.
+Record lifecycle metadata.
+This process ensures bundles remain valid and competitively priced at the time of submission.
+5.4 Lifecycle Tracker
+Purpose
+The Lifecycle Tracker provides end-to-end observability for every submitted bundle.
+Every transaction progresses through multiple commitment levels:
+Submitted
+Processed
+Confirmed
+Finalized
+The tracker records timestamps, slots, and latency measurements at each stage.
+Recorded Metrics
+For every bundle the tracker stores:
+Bundle ID
+Submission slot
+Processed slot
+Confirmed slot
+Finalized slot
+Tip amount
+Failure classification
+Processing latency
+Confirmation latency
+This data forms the basis for operational analysis and bounty lifecycle logs.
+5.5 AI Agent
+Purpose
+The AI Agent owns operational decision making inside the transaction stack.
+Unlike deterministic retry systems, the agent evaluates transaction failures and determines how the system should respond.
+Inputs
+The AI agent receives:
+Failure type
+Slot information
+Tip amount
+Transaction latency
+Network conditions
+Historical context
+Outputs
+The agent may choose to:
+Retry immediately
+Increase tip amount
+Refresh blockhash
+Delay submission
+Abort transaction
+Autonomous Decision Making
+The AI agent uses structured reasoning to determine root causes and generate corrective actions.
+Example:
+Failure:
+Expired Blockhash
+Reasoning:
+The transaction remained pending beyond the blockhash validity window and therefore became invalid before processing.
+Decision:
+Refresh blockhash and resubmit with an updated tip.
+This satisfies the bounty requirement that retry decisions originate from the agent itself rather than hardcoded procedural logic.
+
