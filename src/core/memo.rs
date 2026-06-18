@@ -16,6 +16,7 @@ pub fn create_memo_tx(
     message: &str,
     recent_blockhash: &solana_sdk::hash::Hash,
     tip_ix: Option<Instruction>,   // for the last tx in bundle
+    fault_injection: Option<String>,
 ) -> Result<VersionedTransaction> {
     let mut instructions = vec![Instruction::new_with_bytes(
         Pubkey::from_str(MEMO_PROGRAM_ID)
@@ -23,6 +24,12 @@ pub fn create_memo_tx(
         message.as_bytes(),
         vec![AccountMeta::new(payer.pubkey(), true)],
     )];
+
+    if let Some(fault) = fault_injection {
+        if fault == "compute_exceeded" {
+            instructions.push(solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1));
+        }
+    }
 
     if let Some(tip) = tip_ix {
         instructions.push(tip);

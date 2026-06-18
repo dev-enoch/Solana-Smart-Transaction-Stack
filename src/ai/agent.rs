@@ -48,6 +48,12 @@ impl AiAgent {
     }
 
     fn build_failure_reasoning_prompt(&self, ctx: &FailureContext) -> String {
+        let history_block = if ctx.history_summary.trim().is_empty() {
+            "No previous retry history for this intent.".to_string()
+        } else {
+            ctx.history_summary.clone()
+        };
+
         format!(
             r#"You are an expert Solana transaction operator managing a Jito bundle submission pipeline.
 
@@ -58,9 +64,11 @@ Context for this failure:
 - Tip paid: {} lamports
 - Latency to processed: {}ms
 - Additional details: {}
+- Retry History for this Intent: {}
 
 Reason step by step about the root cause of this failure.
 Consider the Solana transaction lifecycle, Jito bundle mechanics, and network conditions.
+If you see a history of repeated failures of the same type, you MUST adapt your strategy (e.g., increase wait slots or tip significantly). Do not repeat the same failed strategy.
 Then decide the single best next action:
 
 1. "refresh_blockhash" — The blockhash expired. Refresh it and resubmit with an appropriate tip.
@@ -76,7 +84,7 @@ Output valid JSON only (no markdown, no explanation outside the JSON):
   "new_tip_lamports": optional number (suggested tip in lamports, or null),
   "wait_slots": optional number (slots to wait, or null)
 }}"#,
-            ctx.bundle_id, ctx.failure_type, ctx.slot, ctx.tip, ctx.latency, ctx.extra
+            ctx.bundle_id, ctx.failure_type, ctx.slot, ctx.tip, ctx.latency, ctx.extra, history_block
         )
     }
 

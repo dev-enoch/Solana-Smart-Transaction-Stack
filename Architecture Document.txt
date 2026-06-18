@@ -88,7 +88,32 @@ Bundle submission
 Bundle response handling
 Error propagation
 4. High-Level Architecture
-[Insert Architecture Diagram Here]
+```mermaid
+graph TD
+    subgraph Ingestion Layer
+        YS[Yellowstone Streamer] -->|Streams Slots/Txs| ORC[Orchestrator]
+    end
+
+    subgraph Core Transaction Engine
+        TM[Tip Manager] -->|Provides Tip| BB[Bundle Builder]
+        LSC[Leader Schedule Cache] -->|Checks Leader Window| ORC
+        ORC -->|Triggers Build| BB
+    end
+
+    subgraph Submission Layer
+        BB -->|Submits Bundle| JBE[Jito Block Engine]
+    end
+
+    subgraph Tracking & Observability
+        YS -->|Updates Status| LT[Lifecycle Tracker]
+        JBE -->|Bundle ID| LT
+    end
+
+    subgraph Decision Layer
+        LT -->|Failure Event| AI[AI Agent]
+        AI -->|Retry Strategy| ORC
+    end
+```
 The following workflow describes the interaction between all major components.
 Yellowstone continuously streams slot and transaction updates.
 The orchestrator processes stream events.

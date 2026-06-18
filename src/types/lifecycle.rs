@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LifecycleEntry {
+    pub intent_id: String,
     pub bundle_id: String,
     pub slot_submitted: u64,
     pub submitted_at: DateTime<Utc>,
@@ -25,11 +26,13 @@ pub struct LifecycleEntry {
     pub last_valid_block_height: Option<u64>,
     pub retry_count: u32,
     pub signatures: Vec<String>,
+    pub history_summary: String,
 }
 
 impl Default for LifecycleEntry {
     fn default() -> Self {
         Self {
+            intent_id: String::new(),
             bundle_id: String::new(),
             slot_submitted: 0,
             submitted_at: Utc::now(),
@@ -48,6 +51,7 @@ impl Default for LifecycleEntry {
             last_valid_block_height: None,
             retry_count: 0,
             signatures: Vec::new(),
+            history_summary: String::new(),
         }
     }
 }

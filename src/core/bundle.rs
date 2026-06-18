@@ -98,7 +98,6 @@ impl BundleBuilder {
         }
 
         // Submit bundle to Jito Block Engine via sendBundle JSON-RPC
-        /*
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -124,18 +123,6 @@ impl BundleBuilder {
             .as_str()
             .unwrap_or("unknown_id")
             .to_string();
-        */
-        for tx in &transactions {
-            let config = solana_client::rpc_config::RpcSendTransactionConfig {
-                skip_preflight: true,
-                ..Default::default()
-            };
-            match self.rpc_client.send_transaction_with_config(tx, config).await {
-                Ok(_) => {},
-                Err(e) => tracing::error!("Direct RPC send error: {:?}", e),
-            }
-        }
-        let bundle_id = signatures.first().cloned().unwrap_or_else(|| "unknown_id".to_string());
 
         info!(
             "Bundle submitted! ID: {} at slot {} (tip: {} lamports)",

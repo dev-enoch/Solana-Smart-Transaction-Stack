@@ -51,14 +51,17 @@ impl LifecycleTracker {
     /// Record a new bundle submission in the tracker.
     pub async fn record_submission(
         &self,
+        intent_id: String,
         bundle_id: String,
         slot: u64,
         tip: u64,
         signatures: Vec<String>,
         last_valid_block_height: u64,
         retry_count: u32,
+        history_summary: String,
     ) {
         let entry = LifecycleEntry {
+            intent_id,
             bundle_id: bundle_id.clone(),
             slot_submitted: slot,
             submitted_at: Utc::now(),
@@ -66,6 +69,7 @@ impl LifecycleTracker {
             last_valid_block_height: Some(last_valid_block_height),
             signatures: signatures.clone(),
             retry_count,
+            history_summary,
             ..Default::default()
         };
         self.entries.insert(bundle_id.clone(), entry);
@@ -111,30 +115,42 @@ impl LifecycleTracker {
 
     /// Update the commitment status of a bundle.
     pub async fn update_status(&self, bundle_id: &str, commitment: &str, slot: u64) {
+        // Fetch real block time for accurate latency, fallback to slot approximation
+        let block_time_sec = self.rpc_client.get_block_time(slot).await.unwrap_or_else(|_| {
+            let now = Utc::now().timestamp();
+            now
+        });
+
         let event = {
             let mut entry = match self.entries.get_mut(bundle_id) {
                 Some(e) => e,
                 None => return,
             };
 
-            // Don't update already-failed entries with commitment updates
             if entry.status == "failed" && commitment != "failed" {
                 return;
             }
 
-            let now = Utc::now();
+            // Real timestamp from the network block time
+            let real_timestamp = chrono::DateTime::from_timestamp(block_time_sec, 0).unwrap_or(Utc::now());
+            // Ensure timestamp is not before submitted_at
+            let ts = if real_timestamp < entry.submitted_at {
+                entry.submitted_at + chrono::Duration::milliseconds((slot.saturating_sub(entry.slot_submitted)) as i64 * 400)
+            } else {
+                real_timestamp
+            };
 
             match commitment {
                 "processed" if entry.processed_at.is_none() => {
-                    entry.processed_at = Some(now);
+                    entry.processed_at = Some(ts);
                     entry.processed_slot = Some(slot);
-                    let lat = (now - entry.submitted_at).num_milliseconds();
+                    let lat = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_processed_ms = Some(lat);
                     if Self::commitment_ord("processed") > Self::commitment_ord(&entry.status) {
                         entry.status = "processed".to_string();
                     }
                     Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: now,
+                        timestamp: Utc::now(),
                         bundle_id: bundle_id.to_string(),
                         commitment: "processed".to_string(),
                         slot,
@@ -142,15 +158,15 @@ impl LifecycleTracker {
                     })
                 }
                 "confirmed" if entry.confirmed_at.is_none() => {
-                    entry.confirmed_at = Some(now);
+                    entry.confirmed_at = Some(ts);
                     entry.confirmed_slot = Some(slot);
-                    let lat = (now - entry.submitted_at).num_milliseconds();
+                    let lat = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_confirmed_ms = Some(lat);
                     if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
                         entry.status = "confirmed".to_string();
                     }
                     Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: now,
+                        timestamp: Utc::now(),
                         bundle_id: bundle_id.to_string(),
                         commitment: "confirmed".to_string(),
                         slot,
@@ -158,15 +174,15 @@ impl LifecycleTracker {
                     })
                 }
                 "finalized" if entry.finalized_at.is_none() => {
-                    entry.finalized_at = Some(now);
+                    entry.finalized_at = Some(ts);
                     entry.finalized_slot = Some(slot);
-                    let lat = (now - entry.submitted_at).num_milliseconds();
+                    let lat = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_finalized_ms = Some(lat);
                     if Self::commitment_ord("finalized") > Self::commitment_ord(&entry.status) {
                         entry.status = "finalized".to_string();
                     }
                     Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: now,
+                        timestamp: Utc::now(),
                         bundle_id: bundle_id.to_string(),
                         commitment: "finalized".to_string(),
                         slot,
@@ -176,7 +192,7 @@ impl LifecycleTracker {
                 "failed" if entry.status != "failed" => {
                     entry.status = "failed".to_string();
                     Some(OperationalEvent::FailureDetected {
-                        timestamp: now,
+                        timestamp: Utc::now(),
                         bundle_id: bundle_id.to_string(),
                         failure_type: "transaction_error".to_string(),
                         slot,
@@ -190,8 +206,8 @@ impl LifecycleTracker {
         if let Some(ref evt) = event {
             self.logger.log(evt).await;
             match evt {
-                OperationalEvent::CommitmentUpdate { bundle_id, commitment, slot, .. } => {
-                    info!("Commitment: {} → {} at slot {}", bundle_id, commitment, slot);
+                OperationalEvent::CommitmentUpdate { bundle_id, commitment, slot, latency_ms, .. } => {
+                    info!("Commitment: {} → {} at slot {} (latency: {:?}ms)", bundle_id, commitment, slot, latency_ms);
                 }
                 OperationalEvent::FailureDetected { bundle_id, failure_type, .. } => {
                     warn!("Failure: {} — {}", bundle_id, failure_type);
@@ -255,26 +271,26 @@ impl LifecycleTracker {
         }
     }
 
-    /// Check for bundles whose blockhash has expired.
-    /// Returns (bundle_id, slot_submitted, tip_lamports, submitted_at_ms, retry_count).
-    pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, u64, u64, i64, u32)> {
+    pub async fn check_expiries(&self, current_slot: u64) -> Vec<(String, String, u64, u64, i64, u32, String)> {
         let mut expired = Vec::new();
         for mut entry in self.entries.iter_mut() {
             let bid = entry.key().clone();
-            if entry.status == "pending" {
+            if entry.status == "pending" || entry.status == "processed" {
                 if let Some(lvbh) = entry.last_valid_block_height {
-                    // Approximation: blockhash is valid for ~150 slots
-                    if current_slot > entry.slot_submitted + 150 {
+                    // Use actual last_valid_block_height for expiry detection
+                    if current_slot > lvbh {
                         entry.status = "failed".to_string();
                         entry.failure_type = Some("expired_blockhash".to_string());
                         let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
                         warn!("Blockhash expiry detected for bundle {}", bid);
                         expired.push((
+                            entry.intent_id.clone(),
                             bid,
                             entry.slot_submitted,
                             entry.tip_lamports,
                             age_ms,
                             entry.retry_count,
+                            entry.history_summary.clone(),
                         ));
                     }
                 }
@@ -283,7 +299,6 @@ impl LifecycleTracker {
         expired
     }
 
-    /// Advance commitment levels for tracked bundles based on stream slot updates.
     pub async fn advance_commitments_by_slot(&self, current_slot: u64, status: i32) {
         let target_commitment = match status {
             1 => "confirmed",
@@ -291,17 +306,14 @@ impl LifecycleTracker {
             _ => return,
         };
 
-        let updates: Vec<(String, String, u64, Option<i64>)> = {
-            let mut updates = Vec::new();
-
-            for mut entry in self.entries.iter_mut() {
+        let mut to_update = Vec::new();
+        {
+            for entry in self.entries.iter() {
                 let bid = entry.key().clone();
-                // Skip already-failed or already-finalized entries
                 if entry.status == "failed" || entry.status == "finalized" {
                     continue;
                 }
 
-                // Only advance bundles that have been processed at or before this slot
                 let processed_slot = match entry.processed_slot {
                     Some(s) => s,
                     None => continue,
@@ -311,63 +323,25 @@ impl LifecycleTracker {
                     continue;
                 }
 
-                let now = Utc::now();
-
                 match target_commitment {
                     "confirmed" if entry.confirmed_at.is_none() => {
-                        entry.confirmed_at = Some(now);
-                        entry.confirmed_slot = Some(current_slot);
-                        let lat = (now - entry.submitted_at).num_milliseconds();
-                        entry.latency_confirmed_ms = Some(lat);
-                        if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
-                            entry.status = "confirmed".to_string();
-                        }
-                        updates.push((bid.clone(), "confirmed".to_string(), current_slot, Some(lat)));
+                        to_update.push((bid, "confirmed"));
                     }
                     "finalized" => {
-                        // On finalized, also backfill confirmed if missing
                         if entry.confirmed_at.is_none() {
-                            entry.confirmed_at = Some(now);
-                            entry.confirmed_slot = Some(current_slot);
-                            let lat = (now - entry.submitted_at).num_milliseconds();
-                            entry.latency_confirmed_ms = Some(lat);
-                            if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
-                                entry.status = "confirmed".to_string();
-                            }
-                            updates.push((bid.clone(), "confirmed".to_string(), current_slot, Some(lat)));
+                            to_update.push((bid.clone(), "confirmed"));
                         }
-
                         if entry.finalized_at.is_none() {
-                            entry.finalized_at = Some(now);
-                            entry.finalized_slot = Some(current_slot);
-                            let lat = (now - entry.submitted_at).num_milliseconds();
-                            entry.latency_finalized_ms = Some(lat);
-                            if Self::commitment_ord("finalized") > Self::commitment_ord(&entry.status) {
-                                entry.status = "finalized".to_string();
-                            }
-                            updates.push((bid.clone(), "finalized".to_string(), current_slot, Some(lat)));
+                            to_update.push((bid, "finalized"));
                         }
                     }
                     _ => {}
                 }
             }
+        } // Drop lock
 
-            updates
-        }; // Write lock dropped here
-
-        // Log updates outside the lock
-        for (bid, commitment, slot, lat) in &updates {
-            self.logger
-                .log(&OperationalEvent::CommitmentUpdate {
-                    timestamp: Utc::now(),
-                    bundle_id: bid.clone(),
-                    commitment: commitment.clone(),
-                    slot: *slot,
-                    latency_ms: *lat,
-                })
-                .await;
-
-            info!("[Stream] {} → {} (slot {})", bid, commitment, slot);
+        for (bid, commitment) in to_update {
+            self.update_status(&bid, commitment, current_slot).await;
         }
     }
 

@@ -19,7 +19,7 @@ use chrono::Utc;
 
 /// Maximum number of slots to wait for a Jito leader window before submitting anyway.
 /// Prevents queue starvation when Jito validators are not in the upcoming schedule.
-const MAX_WAIT_SLOTS: u64 = 1;
+const MAX_WAIT_SLOTS: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct Intent {
@@ -27,12 +27,13 @@ struct Intent {
     memo: String,
     retries: u32,
     override_tip: Option<u64>,
-    /// If true, the tracker will set a very short last_valid_block_height
-    /// to simulate blockhash expiry for testing the AI retry pipeline.
-    fault_inject_early_expiry: bool,
+    /// Optional failure type to artificially induce on the network (e.g. "expired_blockhash" or "compute_exceeded")
+    fault_injection: Option<String>,
     target_slot: Option<u64>,
     /// The slot at which this intent was first queued, used for fallback submission timing.
     queued_at_slot: Option<u64>,
+    /// Summary of past AI decisions and failures for this intent chain.
+    history_summary: String,
 }
 
 #[tokio::main]
@@ -156,38 +157,41 @@ async fn main() -> Result<()> {
                 memo: format!("smart-stack bundle #{}", i),
                 retries: 0,
                 override_tip: None,
-                fault_inject_early_expiry: false,
+                fault_injection: None,
                 target_slot: None,
                 queued_at_slot: None,
+                history_summary: String::new(),
             });
         }
 
         // Fault injection #1: simulated blockhash expiry
-        queue.push_back(Intent {
+        queue.push_front(Intent {
             id: "bundle_9_fault_expiry".to_string(),
             memo: "smart-stack fault-inject expiry #1".to_string(),
             retries: 0,
             override_tip: None,
-            fault_inject_early_expiry: true,
+            fault_injection: Some("expired_blockhash".to_string()),
             target_slot: None,
             queued_at_slot: None,
+            history_summary: String::new(),
         });
 
         // Fault injection #2: simulated blockhash expiry
-        queue.push_back(Intent {
+        queue.push_front(Intent {
             id: "bundle_10_fault_expiry".to_string(),
             memo: "smart-stack fault-inject expiry #2".to_string(),
             retries: 0,
             override_tip: None,
-            fault_inject_early_expiry: true,
+            fault_injection: Some("compute_exceeded".to_string()),
             target_slot: None,
             queued_at_slot: None,
+            history_summary: String::new(),
         });
 
         info!(
             "Intent queue initialized: {} bundles ({} with fault injection)",
             queue.len(),
-            queue.iter().filter(|i| i.fault_inject_early_expiry).count()
+            queue.iter().filter(|i| i.fault_injection.is_some()).count()
         );
     }
 
@@ -224,7 +228,7 @@ async fn main() -> Result<()> {
 
 
                 let expired_bundles = tracker.check_expiries(current_slot).await;
-                for (bundle_id, _slot_submitted, tip, age_ms, retry_count) in expired_bundles {
+                for (intent_id, bundle_id, _slot_submitted, tip, age_ms, retry_count, history_summary) in expired_bundles {
                     // Log the failure event
                     logger
                         .log(&OperationalEvent::FailureDetected {
@@ -259,6 +263,7 @@ async fn main() -> Result<()> {
                     }
 
                     let ctx = FailureContext {
+                        intent_id,
                         bundle_id: bundle_id.clone(),
                         failure_type: "expired_blockhash".to_string(),
                         slot: current_slot,
@@ -266,12 +271,18 @@ async fn main() -> Result<()> {
                         latency: age_ms,
                         extra: "Blockhash expired before transaction was included in a block"
                             .to_string(),
+                        retry_count,
+                        history_summary,
                     };
 
                     let ai = ai_agent.clone();
                     let q = intent_queue.clone();
                     let log = logger.clone();
                     let next_retry = retry_count + 1;
+                    
+                    let ctx_history_summary = ctx.history_summary.clone();
+                    let ctx_retry_count = ctx.retry_count;
+                    let ctx_failure_type = ctx.failure_type.clone();
 
                     tokio::spawn(async move {
                         match ai.decide_on_failure(ctx).await {
@@ -288,6 +299,15 @@ async fn main() -> Result<()> {
                                 })
                                 .await;
 
+                                let new_history = format!(
+                                    "{} | [Retry {}] Failed with {}. AI decided: {} (Reasoning: {})",
+                                    ctx_history_summary,
+                                    ctx_retry_count,
+                                    ctx_failure_type,
+                                    decision.action,
+                                    decision.reasoning
+                                );
+
                                 match decision.action.as_str() {
                                     "refresh_blockhash" => {
                                         let new_id = format!("{}_retry_bh", bundle_id);
@@ -297,9 +317,10 @@ async fn main() -> Result<()> {
                                                 .to_string(),
                                             retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
-                                            fault_inject_early_expiry: false,
+                                            fault_injection: None,
                                             target_slot: None,
                                             queued_at_slot: None,
+                                            history_summary: new_history,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -324,9 +345,10 @@ async fn main() -> Result<()> {
                                             memo: "smart-stack retry (higher tip)".to_string(),
                                             retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
-                                            fault_inject_early_expiry: false,
+                                            fault_injection: None,
                                             target_slot: None,
                                             queued_at_slot: None,
+                                            history_summary: new_history,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -352,9 +374,10 @@ async fn main() -> Result<()> {
                                             memo: "smart-stack retry (waited for slot)".to_string(),
                                             retries: next_retry,
                                             override_tip: decision.new_tip_lamports,
-                                            fault_inject_early_expiry: false,
+                                            fault_injection: None,
                                             target_slot: target,
                                             queued_at_slot: None,
+                                            history_summary: new_history,
                                         };
 
                                         log.log(&OperationalEvent::RetryQueued {
@@ -387,6 +410,13 @@ async fn main() -> Result<()> {
                                     e
                                 );
 
+                                let new_history = format!(
+                                    "{} | [Retry {}] Failed with {}. Fallback activated due to LLM error.",
+                                    ctx_history_summary,
+                                    ctx_retry_count,
+                                    ctx_failure_type
+                                );
+
                                 let fallback_tip = (tip as f64 * 1.5) as u64;
                                 let new_id = format!("{}_retry_fallback", bundle_id);
                                 let new_intent = Intent {
@@ -395,9 +425,10 @@ async fn main() -> Result<()> {
                                         .to_string(),
                                     retries: next_retry,
                                     override_tip: Some(fallback_tip),
-                                    fault_inject_early_expiry: false,
+                                    fault_injection: None,
                                     target_slot: Some(current_slot + 5),
                                     queued_at_slot: None,
+                                    history_summary: new_history,
                                 };
 
                                 log.log(&OperationalEvent::RetryQueued {
@@ -490,6 +521,7 @@ async fn main() -> Result<()> {
                             &memo_str,
                             &blockhash,
                             None,
+                            intent.fault_injection.clone(),
                         ) {
                             Ok(tx) => tx,
                             Err(e) => {
@@ -521,12 +553,14 @@ async fn main() -> Result<()> {
                                     actual_tip,
                                 )) => {
                                     trk.record_submission(
+                                        intent_clone.id.clone(),
                                         bundle_id.clone(),
                                         current_slot,
                                         actual_tip,
                                         signatures.clone(),
                                         last_valid_block_height,
                                         intent_clone.retries,
+                                        intent_clone.history_summary,
                                     )
                                     .await;
 
