@@ -137,14 +137,34 @@ pub enum OperationalEvent {
     },
 
     /// Stream health metrics report (emitted periodically).
-    #[serde(rename = "stream_health")]
-    StreamHealth {
+    #[serde(rename = "system_health")]
+    SystemHealth {
         timestamp: DateTime<Utc>,
         messages_per_sec: f64,
         total_slot_updates: u64,
         total_tx_updates: u64,
         messages_dropped: u64,
         reconnection_count: u64,
+        rpc_fallback_count: u64,
+        jito_success_count: u64,
+        jito_failure_count: u64,
+        channel_saturation: f64,
+    },
+
+    /// Universal transaction lifecycle event.
+    #[serde(rename = "transaction_event")]
+    TransactionEvent {
+        transaction_id: String,
+        slot: u64,
+        block_height: Option<u64>,
+        timestamp: DateTime<Utc>,
+        lifecycle_state: String,
+        latency_delta_ms: Option<i64>,
+        previous_state: String,
+        next_state: String,
+        state_transition_valid: bool,
+        transition_reason: String,
+        details: Option<String>,
     },
 }
 

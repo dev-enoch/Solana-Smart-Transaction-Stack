@@ -88,7 +88,7 @@ impl YellowstoneStreamer {
     }
 
     pub async fn update_leader_schedule(&self, start_slot: u64) -> Result<()> {
-        let leaders = self.rpc_client.get_slot_leaders(start_slot, 100).await?;
+        let leaders = self.rpc_client.get_slot_leaders(start_slot, 200).await?;
         let mut schedule = self.leader_schedule.write().await;
         for (i, leader) in leaders.iter().enumerate() {
             schedule.insert(start_slot + i as u64, leader.to_string());
@@ -174,38 +174,65 @@ impl YellowstoneStreamer {
                     match update_oneof {
                         UpdateOneof::Slot(slot) => {
                             let current_slot = slot.slot;
+                            let ingest_span = tracing::debug_span!("yellowstone_event_ingestion", slot = current_slot, event_type = "slot");
+                            let _enter = ingest_span.enter();
+                            
                             let slot_status = slot.status;
-                            if current_slot % 50 == 0 {
-                                let _ = self.update_leader_schedule(current_slot).await;
+                            if current_slot % 100 == 0 {
+                                let self_clone = self.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = self_clone.update_leader_schedule(current_slot).await {
+                                        tracing::warn!("Failed to fetch leader schedule: {:?}", e);
+                                    }
+                                });
                             }
 
                             let schedule = self.leader_schedule.read().await;
                             let leader = schedule.get(&current_slot).cloned();
 
-                            if let Err(e) = self.event_tx.send(StreamEvent::Slot(SlotUpdate {
+                            if let Err(e) = self.event_tx.try_send(StreamEvent::Slot(SlotUpdate {
                                 slot: current_slot,
                                 timestamp: chrono::Utc::now(),
                                 leader,
                                 status: slot_status,
-                            })).await {
-                                error!("Failed to send slot update: {:?}", e);
-                                break;
+                                block_height: None,
+                            })) {
+                                match e {
+                                    tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                        tracing::warn!("Dropped slot update due to channel backpressure");
+                                    }
+                                    tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                        tracing::error!("Event channel closed, stopping streamer");
+                                        break;
+                                    }
+                                }
                             }
                         }
                         UpdateOneof::Transaction(tx) => {
+                            let tx_slot = tx.slot;
+                            let ingest_span = tracing::debug_span!("yellowstone_event_ingestion", slot = tx_slot, event_type = "transaction");
+                            let _enter = ingest_span.enter();
+
                             if let Some(info) = tx.transaction {
                                 let sig_bytes = info.signature;
                                 let signature = bs58::encode(&sig_bytes).into_string();
                                 
                                 let error = info.meta.and_then(|m| m.err.map(|e| format!("{:?}", e.err)));
                                 
-                                if let Err(e) = self.event_tx.send(StreamEvent::Transaction(TransactionUpdate {
+                                if let Err(e) = self.event_tx.try_send(StreamEvent::Transaction(TransactionUpdate {
                                     signature,
                                     slot: tx.slot,
                                     error,
-                                })).await {
-                                    error!("Failed to send tx update: {:?}", e);
-                                    break;
+                                })) {
+                                    match e {
+                                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                            tracing::warn!("Dropped tx update due to channel backpressure");
+                                        }
+                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                            tracing::error!("Event channel closed, stopping streamer");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }

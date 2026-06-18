@@ -38,6 +38,7 @@ impl BundleBuilder {
         mut transactions: Vec<VersionedTransaction>,
         slot: u64,
         override_tip: Option<u64>,
+        retry_count: u32,
     ) -> Result<(String, Vec<String>, u64, u64)> {
         let tip_account = self
             .tip_manager
@@ -53,7 +54,11 @@ impl BundleBuilder {
                 info!("Using AI-overridden tip: {} lamports", tip);
                 tip
             }
-            None => self.tip_manager.calculate_dynamic_tip(100_000, 1.5).await?,
+            None => {
+                // Estimate compute units (200,000 for standard tx)
+                let estimated_cu = 200_000;
+                self.tip_manager.calculate_dynamic_tip(estimated_cu, retry_count).await?
+            }
         };
 
         info!(

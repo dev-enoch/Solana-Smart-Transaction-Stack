@@ -10,6 +10,7 @@ use solana_smart_tx_stack_rs::types::ai::FailureContext;
 use solana_smart_tx_stack_rs::types::streaming::StreamEvent;
 use tokio::sync::mpsc;
 use tracing::info;
+use tracing::Instrument;
 use solana_sdk::signature::Signer;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::collections::VecDeque;
@@ -95,12 +96,9 @@ async fn main() -> Result<()> {
     let logger = StructuredLogger::new("operational_events.jsonl")
         .expect("Failed to create structured logger");
 
-
     // Single shared RPC client used by all components
-    info!("Initializing RPC client: {}", rpc_url);
     let rpc_client = Arc::new(RpcClient::new(rpc_url.clone()));
 
-    info!("Starting TipManager with Jito Block Engine: {}", jito_url);
     let tip_manager = TipManager::new(rpc_client.clone(), &jito_url);
 
     let payer_bytes = payer.to_bytes();
@@ -112,20 +110,28 @@ async fn main() -> Result<()> {
         rpc_client.clone(),
     ));
 
-    info!("Initializing LifecycleTracker and AI Agent");
     let tracker = Arc::new(LifecycleTracker::new(
         "lifecycle_logs.json",
         logger.clone(),
         rpc_client.clone(),
     ));
-    let ai_agent = Arc::new(AiAgent::new(ai_api_url, ai_api_key, ai_model));
-
+    let ai_agent = Arc::new(AiAgent::new(ai_api_url, ai_api_key, ai_model.clone()));
 
     tip_manager.start_tip_updater().await;
 
+    logger.log(&OperationalEvent::SystemStartup {
+        timestamp: chrono::Utc::now(),
+        network,
+        rpc_url,
+        jito_url,
+        yellowstone_endpoint: endpoint.clone(),
+        ai_primary_provider: ai_model,
+        ai_fallback_provider: None,
+        payer_pubkey: payer.pubkey().to_string(),
+        jito_validator_count: jito_validators.len(),
+    }).await;
 
     let (event_tx, mut event_rx) = mpsc::channel::<StreamEvent>(100);
-    info!("Connecting to Yellowstone at {}", endpoint);
     let streamer = YellowstoneStreamer::new(
         &endpoint,
         x_token,
@@ -214,6 +220,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    let logger_health = logger.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            
+            logger_health.log(&OperationalEvent::SystemHealth {
+                timestamp: Utc::now(),
+                messages_per_sec: 0.0, 
+                total_slot_updates: 0,
+                total_tx_updates: 0,
+                messages_dropped: 0,
+                reconnection_count: 0,
+                rpc_fallback_count: 0,
+                jito_success_count: 0,
+                jito_failure_count: 0,
+                channel_saturation: 0.0,
+            }).await;
+        }
+    });
 
     info!("Entering main event loop...");
     let mut last_submission = tokio::time::Instant::now() - std::time::Duration::from_secs(5);
@@ -225,8 +251,14 @@ async fn main() -> Result<()> {
 
                 tracker.advance_commitments_by_slot(current_slot, update.status).await;
 
+                if tracker.has_pending_bundles() {
+                    let block_height = match update.block_height {
+                        Some(bh) => bh,
+                        None => rpc_client.get_block_height().await.unwrap_or(0),
+                    };
 
-                let expired_bundles = tracker.check_expiries(current_slot).await;
+                    if block_height > 0 {
+                        let expired_bundles = tracker.check_expiries(block_height).await;
                 for (intent_id, bundle_id, _slot_submitted, tip, age_ms, retry_count, history_summary) in expired_bundles {
                     // Log the failure event
                     logger
@@ -261,17 +293,21 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    let network_snapshot = tip_manager.get_network_snapshot().await;
+
                     let ctx = FailureContext {
-                        intent_id,
+                        intent_id: intent_id.clone(),
                         bundle_id: bundle_id.clone(),
                         failure_type: "expired_blockhash".to_string(),
                         slot: current_slot,
                         tip,
                         latency: age_ms,
-                        extra: "Blockhash expired before transaction was included in a block"
-                            .to_string(),
+                        extra: "Blockhash expired before transaction was included in a block".to_string(),
                         retry_count,
-                        history_summary,
+                        history_summary: history_summary.clone(),
+                        retry_history_ref: format!("history_{}", intent_id),
+                        failure_chain: vec!["expired_blockhash".to_string()],
+                        network_snapshot: Some(network_snapshot),
                     };
 
                     let ai = ai_agent.clone();
@@ -284,6 +320,12 @@ async fn main() -> Result<()> {
                     let ctx_failure_type = ctx.failure_type.clone();
 
                     tokio::spawn(async move {
+                        let retry_span = tracing::info_span!("retry_cycle", intent_id = intent_id, bundle_id = bundle_id, failure = ctx_failure_type, retry = ctx_retry_count);
+                        let _enter = retry_span.enter();
+
+                        let mut trigger_fallback = false;
+                        let mut llm_error_msg = String::new();
+
                         match ai.decide_on_failure(ctx).await {
                             Ok(decision) => {
                                 // Log AI decision
@@ -295,6 +337,8 @@ async fn main() -> Result<()> {
                                     root_cause: decision.root_cause.clone(),
                                     new_tip: decision.new_tip_lamports,
                                     wait_slots: decision.wait_slots,
+                                    confidence: decision.confidence,
+                                    provider: "gemini".to_string(),
                                 })
                                 .await;
 
@@ -394,64 +438,54 @@ async fn main() -> Result<()> {
                                         info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
                                         q.lock().await.push_back(new_intent);
                                     }
-                                    "abort" | _ => {
+                                    "abort" => {
                                         info!(
                                             "AI → abort bundle {} (reason: {})",
                                             bundle_id, decision.reasoning
                                         );
+                                        log.log(&OperationalEvent::FailureDetected {
+                                            timestamp: Utc::now(),
+                                            bundle_id: bundle_id.clone(),
+                                            failure_type: "aborted_by_ai".to_string(),
+                                            slot: current_slot,
+                                            details: format!("AI decided to abort: {}", decision.reasoning),
+                                        }).await;
+                                    }
+                                    _ => {
+                                        tracing::warn!("AI returned unknown action: {}. Falling back to deterministic strategy.", decision.action);
+                                        trigger_fallback = true;
+                                        llm_error_msg = format!("AI returned invalid action: {}", decision.action);
                                     }
                                 }
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "AI decision failed for {}: {:?}. Activating fallback retry.",
+                                    "AI decision failed for {}: {:?}. Activating deterministic fallback retry.",
                                     bundle_id,
                                     e
                                 );
-
-                                let new_history = format!(
-                                    "{} | [Retry {}] Failed with {}. Fallback activated due to LLM error.",
-                                    ctx_history_summary,
-                                    ctx_retry_count,
-                                    ctx_failure_type
-                                );
-
-                                let fallback_tip = (tip as f64 * 1.5) as u64;
-                                let new_id = format!("{}_retry_fallback", bundle_id);
-                                let new_intent = Intent {
-                                    id: new_id.clone(),
-                                    memo: "smart-stack retry (AI fallback: refresh blockhash)"
-                                        .to_string(),
-                                    retries: next_retry,
-                                    override_tip: Some(fallback_tip),
-                                    fault_injection: None,
-                                    target_slot: Some(current_slot + 5),
-                                    queued_at_slot: None,
-                                    history_summary: new_history,
-                                };
-
-                                log.log(&OperationalEvent::RetryQueued {
-                                    timestamp: Utc::now(),
-                                    original_bundle_id: bundle_id.clone(),
-                                    new_intent_id: new_id,
-                                    reason: format!(
-                                        "AI fallback: LLM unavailable ({:?}), auto-retry with refreshed blockhash and 1.5x tip",
-                                        e
-                                    ),
-                                    new_tip: Some(fallback_tip),
-                                })
-                                .await;
-
-                                info!(
-                                    "AI fallback → refresh_blockhash + wait 5 slots | tip: {} | retry {}/{}",
-                                    fallback_tip, next_retry, MAX_RETRIES
-                                );
-                                q.lock().await.push_back(new_intent);
+                                trigger_fallback = true;
+                                llm_error_msg = format!("LLM error: {:?}", e);
                             }
                         }
-                    });
-                }
 
+                        if trigger_fallback {
+                            info!(
+                                "AI failure/fallback triggered and deterministic fallback is disabled. Aborting bundle chain {}.",
+                                bundle_id
+                            );
+                            log.log(&OperationalEvent::FailureDetected {
+                                timestamp: Utc::now(),
+                                bundle_id: bundle_id.clone(),
+                                failure_type: "aborted_no_fallback".to_string(),
+                                slot: current_slot,
+                                details: format!("AI reasoning failed: {}. Aborted due to fallback removal policy.", llm_error_msg),
+                            }).await;
+                        }
+                    }.instrument(tracing::Span::current()));
+                }
+                    }
+                }
 
                 let mut queue = intent_queue.lock().await;
                 if !queue.is_empty() {
@@ -498,10 +532,8 @@ async fn main() -> Result<()> {
                         last_submission = tokio::time::Instant::now();
                         drop(queue); // Release lock before async work
 
-                        info!(
-                            "--- Submitting Intent: {} at slot {} (retry {}/{}) ---",
-                            intent.id, current_slot, intent.retries, MAX_RETRIES
-                        );
+                        let submission_span = tracing::info_span!("bundle_submission", intent_id = intent.id, slot = current_slot, retry_count = intent.retries);
+                        let _enter = submission_span.enter();
 
                         // Fetch fresh blockhash using async RPC
                         let blockhash = match rpc_client.get_latest_blockhash_with_commitment(solana_sdk::commitment_config::CommitmentConfig::confirmed()).await {
@@ -542,13 +574,14 @@ async fn main() -> Result<()> {
                                     vec![vtx],
                                     current_slot,
                                     intent_clone.override_tip,
+                                    intent_clone.retries,
                                 )
                                 .await
                             {
                                 Ok((
                                     bundle_id,
                                     signatures,
-                                    mut last_valid_block_height,
+                                    last_valid_block_height,
                                     actual_tip,
                                 )) => {
                                     trk.record_submission(
@@ -560,6 +593,7 @@ async fn main() -> Result<()> {
                                         last_valid_block_height,
                                         intent_clone.retries,
                                         intent_clone.history_summary,
+                                        None,
                                     )
                                     .await;
 
@@ -569,9 +603,11 @@ async fn main() -> Result<()> {
                                         timestamp: Utc::now(),
                                         bundle_id,
                                         slot: current_slot,
+                                        block_height: None,
                                         tip_lamports: actual_tip,
                                         signatures,
                                         memo: intent_clone.memo,
+                                        fault_injection: intent_clone.fault_injection,
                                     })
                                     .await;
                                 }
@@ -584,12 +620,12 @@ async fn main() -> Result<()> {
                                         slot: current_slot,
                                     })
                                     .await;
-                                    tracing::info!("Re-queueing intent {} due to Jito API error", intent_clone.id);
+                                    tracing::warn!("Re-queueing intent {} due to Jito API error", intent_clone.id);
                                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     q_clone.lock().await.push_front(intent_clone);
                                 }
                             }
-                        });
+                        }.instrument(submission_span.clone()));
                     }
                 }
             }
@@ -600,6 +636,214 @@ async fn main() -> Result<()> {
                     tracker
                         .update_failure_by_sig(&tx_update.signature, error_msg, tx_update.slot)
                         .await;
+
+                    // Intercept and orchestrate AI-driven retries for execution failures
+                    if let Some(entry) = tracker.get_entry_by_sig(&tx_update.signature) {
+                        let failure_type = LifecycleTracker::classify_failure(error_msg);
+                        let retry_count = entry.retry_count;
+                        let bundle_id = entry.bundle_id.clone();
+                        let current_slot = tx_update.slot;
+
+                        logger
+                            .log(&OperationalEvent::FailureDetected {
+                                timestamp: Utc::now(),
+                                bundle_id: bundle_id.clone(),
+                                failure_type: failure_type.clone(),
+                                slot: current_slot,
+                                details: format!("Execution failure streamed: {}", error_msg),
+                            })
+                            .await;
+
+                        if retry_count >= MAX_RETRIES {
+                            info!(
+                                "Retry cap reached for execution error on {} (retries: {}/{}). Abandoning bundle chain.",
+                                bundle_id, retry_count, MAX_RETRIES
+                            );
+                            logger
+                                .log(&OperationalEvent::FailureDetected {
+                                    timestamp: Utc::now(),
+                                    bundle_id: bundle_id.clone(),
+                                    failure_type: "max_retries_exceeded".to_string(),
+                                    slot: current_slot,
+                                    details: format!("Execution failure retry cap reached ({} retries)", retry_count),
+                                })
+                                .await;
+                        } else {
+                            let network_snapshot = tip_manager.get_network_snapshot().await;
+
+                            let ctx = FailureContext {
+                                intent_id: entry.intent_id.clone(),
+                                bundle_id: bundle_id.clone(),
+                                failure_type: failure_type.clone(),
+                                slot: current_slot,
+                                tip: entry.tip_lamports,
+                                latency: (Utc::now() - entry.submitted_at).num_milliseconds(),
+                                extra: format!("Execution failure: {}", error_msg),
+                                retry_count,
+                                history_summary: entry.history_summary.clone(),
+                                retry_history_ref: format!("history_{}", entry.intent_id),
+                                failure_chain: vec![failure_type.clone()],
+                                network_snapshot: Some(network_snapshot),
+                            };
+
+                            let ai = ai_agent.clone();
+                            let q = intent_queue.clone();
+                            let log = logger.clone();
+                            let next_retry = retry_count + 1;
+                            
+                            let ctx_history_summary = ctx.history_summary.clone();
+                            let ctx_retry_count = ctx.retry_count;
+                            let ctx_failure_type = ctx.failure_type.clone();
+                            let intent_id_for_span = entry.intent_id.clone();
+
+                            tokio::spawn(async move {
+                                let retry_span = tracing::info_span!("retry_cycle_execution", intent_id = intent_id_for_span, bundle_id = bundle_id, failure = ctx_failure_type, retry = ctx_retry_count);
+                                let _enter = retry_span.enter();
+
+                                let mut trigger_fallback = false;
+                                let mut llm_error_msg = String::new();
+
+                                match ai.decide_on_failure(ctx).await {
+                                    Ok(decision) => {
+                                        log.log(&OperationalEvent::AiDecision {
+                                            timestamp: Utc::now(),
+                                            bundle_id: bundle_id.clone(),
+                                            action: decision.action.clone(),
+                                            reasoning: decision.reasoning.clone(),
+                                            root_cause: decision.root_cause.clone(),
+                                            new_tip: decision.new_tip_lamports,
+                                            wait_slots: decision.wait_slots,
+                                            confidence: decision.confidence,
+                                            provider: "gemini".to_string(),
+                                        })
+                                        .await;
+
+                                        let new_history = format!(
+                                            "{} | [Retry {}] Failed with {}. AI decided: {} (Reasoning: {})",
+                                            ctx_history_summary,
+                                            ctx_retry_count,
+                                            ctx_failure_type,
+                                            decision.action,
+                                            decision.reasoning
+                                        );
+
+                                        match decision.action.as_str() {
+                                            "refresh_blockhash" => {
+                                                let new_id = format!("{}_retry_bh", bundle_id);
+                                                let new_intent = Intent {
+                                                    id: new_id.clone(),
+                                                    memo: "smart-stack retry (refreshed blockhash)".to_string(),
+                                                    retries: next_retry,
+                                                    override_tip: decision.new_tip_lamports,
+                                                    fault_injection: None,
+                                                    target_slot: None,
+                                                    queued_at_slot: None,
+                                                    history_summary: new_history,
+                                                };
+
+                                                log.log(&OperationalEvent::RetryQueued {
+                                                    timestamp: Utc::now(),
+                                                    original_bundle_id: bundle_id.clone(),
+                                                    new_intent_id: new_id,
+                                                    reason: "AI: refresh blockhash and retry".to_string(),
+                                                    new_tip: decision.new_tip_lamports,
+                                                })
+                                                .await;
+
+                                                info!("AI → refresh_blockhash | tip: {:?} | retry {}/{}", new_intent.override_tip, next_retry, MAX_RETRIES);
+                                                q.lock().await.push_back(new_intent);
+                                            }
+                                            "retry_higher_tip" => {
+                                                let new_id = format!("{}_retry_tip", bundle_id);
+                                                let new_intent = Intent {
+                                                    id: new_id.clone(),
+                                                    memo: "smart-stack retry (higher tip)".to_string(),
+                                                    retries: next_retry,
+                                                    override_tip: decision.new_tip_lamports,
+                                                    fault_injection: None,
+                                                    target_slot: None,
+                                                    queued_at_slot: None,
+                                                    history_summary: new_history,
+                                                };
+
+                                                log.log(&OperationalEvent::RetryQueued {
+                                                    timestamp: Utc::now(),
+                                                    original_bundle_id: bundle_id.clone(),
+                                                    new_intent_id: new_id,
+                                                    reason: "AI: retry with higher tip".to_string(),
+                                                    new_tip: decision.new_tip_lamports,
+                                                })
+                                                .await;
+
+                                                info!("AI → retry_higher_tip | tip: {:?} | retry {}/{}", new_intent.override_tip, next_retry, MAX_RETRIES);
+                                                q.lock().await.push_back(new_intent);
+                                            }
+                                            "wait" => {
+                                                let target = decision.wait_slots.map(|w| current_slot + w);
+                                                let new_id = format!("{}_retry_wait", bundle_id);
+                                                let new_intent = Intent {
+                                                    id: new_id.clone(),
+                                                    memo: "smart-stack retry (waited for slot)".to_string(),
+                                                    retries: next_retry,
+                                                    override_tip: decision.new_tip_lamports,
+                                                    fault_injection: None,
+                                                    target_slot: target,
+                                                    queued_at_slot: None,
+                                                    history_summary: new_history,
+                                                };
+
+                                                log.log(&OperationalEvent::RetryQueued {
+                                                    timestamp: Utc::now(),
+                                                    original_bundle_id: bundle_id.clone(),
+                                                    new_intent_id: new_id,
+                                                    reason: format!("AI: wait for target slot {:?}", target),
+                                                    new_tip: decision.new_tip_lamports,
+                                                })
+                                                .await;
+
+                                                info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
+                                                q.lock().await.push_back(new_intent);
+                                            }
+                                            "abort" => {
+                                                info!("AI → abort bundle {} (reason: {})", bundle_id, decision.reasoning);
+                                                log.log(&OperationalEvent::FailureDetected {
+                                                    timestamp: Utc::now(),
+                                                    bundle_id: bundle_id.clone(),
+                                                    failure_type: "aborted_by_ai".to_string(),
+                                                    slot: current_slot,
+                                                    details: format!("AI decided to abort: {}", decision.reasoning),
+                                                }).await;
+                                            }
+                                            _ => {
+                                                tracing::warn!("AI returned unknown action: {}.", decision.action);
+                                                trigger_fallback = true;
+                                                llm_error_msg = format!("AI returned invalid action: {}", decision.action);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("AI decision failed for {}: {:?}", bundle_id, e);
+                                        trigger_fallback = true;
+                                        llm_error_msg = format!("LLM error: {:?}", e);
+                                    }
+                                }
+
+                                if trigger_fallback {
+                                    info!(
+                                        "AI failure/fallback triggered and deterministic fallback is disabled. Aborting bundle chain {}.",
+                                        bundle_id
+                                    );
+                                    log.log(&OperationalEvent::FailureDetected {
+                                        timestamp: Utc::now(),
+                                        bundle_id: bundle_id.clone(),
+                                        failure_type: "aborted_no_fallback".to_string(),
+                                        slot: current_slot,
+                                        details: format!("AI reasoning failed: {}. Aborted due to fallback removal policy.", llm_error_msg),
+                                    }).await;
+                                }
+                            });
+                        }
+                    }
                 } else {
                     tracker
                         .update_status_by_sig(&tx_update.signature, "processed", tx_update.slot)

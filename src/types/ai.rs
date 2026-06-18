@@ -12,6 +12,8 @@ pub struct FailureContext {
     pub extra: String,
     pub retry_count: u32,
     pub history_summary: String,
+    pub retry_history_ref: String,
+    pub failure_chain: Vec<String>,
     /// Snapshot of current network conditions for the AI agent to consider.
     pub network_snapshot: Option<NetworkSnapshot>,
 }

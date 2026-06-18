@@ -99,30 +99,31 @@ impl LifecycleTracker {
     /// Classify a transaction error string into a failure category.
     pub fn classify_failure(error: &str) -> String {
         let lower = error.to_lowercase();
-        if lower.contains("blockhashnotfound")
-            || lower.contains("blockhash not found")
-            || lower.contains("blockhash expired")
-        {
+        
+        if lower.contains("blockhashnotfound") || lower.contains("blockhash not found") || lower.contains("blockhash expired") {
             "expired_blockhash".to_string()
-        } else if lower.contains("insufficientfunds")
-            || lower.contains("insufficient funds")
-            || lower.contains("insufficient lamports")
-        {
+        } else if lower.contains("insufficientfunds") || lower.contains("insufficient funds") || lower.contains("insufficient lamports") {
             "insufficient_funds".to_string()
-        } else if lower.contains("computationalbudgetexceeded")
-            || lower.contains("computational budget exceeded")
-            || lower.contains("exceeded cus meter")
-            || lower.contains("exceeded compute")
-        {
+        } else if lower.contains("computationalbudgetexceeded") || lower.contains("computational budget exceeded") || lower.contains("exceeded compute") {
             "compute_exceeded".to_string()
         } else if lower.contains("alreadyprocessed") || lower.contains("already processed") {
             "already_processed".to_string()
-        } else if lower.contains("bundle") || lower.contains("bundledrop") {
-            "bundle_failure".to_string()
+        } else if lower.contains("bundle rejected") || lower.contains("bundledrop") || lower.contains("dropped") {
+            "bundle_rejected".to_string()
+        } else if lower.contains("leader missed") || lower.contains("slot missed") {
+            "leader_missed".to_string()
+        } else if lower.contains("rpc error") || lower.contains("server error") || lower.contains("502") || lower.contains("503") || lower.contains("429") {
+            "rpc_failure".to_string()
+        } else if lower.contains("timeout") || lower.contains("deadline exceeded") {
+            "network_timeout".to_string()
         } else if lower.contains("fee") && (lower.contains("too low") || lower.contains("insufficient")) {
-            "fee_too_low".to_string()
+            "insufficient_priority_fee".to_string()
+        } else if lower.contains("simulation failed") || lower.contains("instructionerror") || lower.contains("program error") {
+            "simulation_failure".to_string()
+        } else if lower.contains("accountinuse") || lower.contains("account in use") || lower.contains("accountnotfound") || lower.contains("invalid account") {
+            "account_error".to_string()
         } else {
-            "transaction_error".to_string()
+            "unknown_failure".to_string()
         }
     }
 
@@ -186,15 +187,22 @@ impl LifecycleTracker {
                     entry.processed_slot = Some(slot);
                     let lat = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_processed_ms = Some(lat);
+                    let previous = entry.status.clone();
                     if Self::commitment_ord("processed") > Self::commitment_ord(&entry.status) {
                         entry.status = "processed".to_string();
                     }
-                    Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: Utc::now(),
-                        bundle_id: bundle_id.to_string(),
-                        commitment: "processed".to_string(),
+                    Some(OperationalEvent::TransactionEvent {
+                        transaction_id: entry.intent_id.clone(),
                         slot,
-                        latency_ms: Some(lat),
+                        block_height: entry.block_height_submitted,
+                        timestamp: ts,
+                        lifecycle_state: "processed".to_string(),
+                        latency_delta_ms: Some(lat),
+                        previous_state: previous,
+                        next_state: "processed".to_string(),
+                        state_transition_valid: true,
+                        transition_reason: "Observed processed commitment in Yellowstone stream".to_string(),
+                        details: Some(format!("Bundle ID: {}", bundle_id)),
                     })
                 }
                 "confirmed" if entry.confirmed_at.is_none() => {
@@ -203,21 +211,27 @@ impl LifecycleTracker {
                     let lat_from_submitted = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_confirmed_ms = Some(lat_from_submitted);
 
-                    // Calculate the critical processed→confirmed delta
-                    if let Some(proc_at) = entry.processed_at {
-                        let delta = (ts - proc_at).num_milliseconds();
-                        entry.latency_processed_to_confirmed_ms = Some(delta);
+                    let delta = entry.processed_at.map(|p| (ts - p).num_milliseconds());
+                    if let Some(d) = delta {
+                        entry.latency_processed_to_confirmed_ms = Some(d);
                     }
 
+                    let previous = entry.status.clone();
                     if Self::commitment_ord("confirmed") > Self::commitment_ord(&entry.status) {
                         entry.status = "confirmed".to_string();
                     }
-                    Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: Utc::now(),
-                        bundle_id: bundle_id.to_string(),
-                        commitment: "confirmed".to_string(),
+                    Some(OperationalEvent::TransactionEvent {
+                        transaction_id: entry.intent_id.clone(),
                         slot,
-                        latency_ms: Some(lat_from_submitted),
+                        block_height: entry.block_height_submitted,
+                        timestamp: ts,
+                        lifecycle_state: "confirmed".to_string(),
+                        latency_delta_ms: delta,
+                        previous_state: previous,
+                        next_state: "confirmed".to_string(),
+                        state_transition_valid: true,
+                        transition_reason: "Observed confirmed commitment in Yellowstone stream".to_string(),
+                        details: Some(format!("Bundle ID: {}", bundle_id)),
                     })
                 }
                 "finalized" if entry.finalized_at.is_none() => {
@@ -225,25 +239,42 @@ impl LifecycleTracker {
                     entry.finalized_slot = Some(slot);
                     let lat = (ts - entry.submitted_at).num_milliseconds();
                     entry.latency_finalized_ms = Some(lat);
+                    
+                    let delta = entry.confirmed_at.map(|c| (ts - c).num_milliseconds());
+
+                    let previous = entry.status.clone();
                     if Self::commitment_ord("finalized") > Self::commitment_ord(&entry.status) {
                         entry.status = "finalized".to_string();
                     }
-                    Some(OperationalEvent::CommitmentUpdate {
-                        timestamp: Utc::now(),
-                        bundle_id: bundle_id.to_string(),
-                        commitment: "finalized".to_string(),
+                    Some(OperationalEvent::TransactionEvent {
+                        transaction_id: entry.intent_id.clone(),
                         slot,
-                        latency_ms: Some(lat),
+                        block_height: entry.block_height_submitted,
+                        timestamp: ts,
+                        lifecycle_state: "finalized".to_string(),
+                        latency_delta_ms: delta,
+                        previous_state: previous,
+                        next_state: "finalized".to_string(),
+                        state_transition_valid: true,
+                        transition_reason: "Observed finalized commitment in Yellowstone stream".to_string(),
+                        details: Some(format!("Bundle ID: {}", bundle_id)),
                     })
                 }
                 "failed" if entry.status != "failed" => {
+                    let previous = entry.status.clone();
                     entry.status = "failed".to_string();
-                    Some(OperationalEvent::FailureDetected {
-                        timestamp: Utc::now(),
-                        bundle_id: bundle_id.to_string(),
-                        failure_type: "transaction_error".to_string(),
+                    Some(OperationalEvent::TransactionEvent {
+                        transaction_id: entry.intent_id.clone(),
                         slot,
-                        details: "Transaction error observed via stream".to_string(),
+                        block_height: entry.block_height_submitted,
+                        timestamp: Utc::now(),
+                        lifecycle_state: "failed".to_string(),
+                        latency_delta_ms: None,
+                        previous_state: previous,
+                        next_state: "failed".to_string(),
+                        state_transition_valid: true,
+                        transition_reason: "Transaction error observed via stream".to_string(),
+                        details: Some("Transaction error observed via stream".to_string()),
                     })
                 }
                 _ => None,
@@ -274,6 +305,36 @@ impl LifecycleTracker {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Check if there are any pending bundles.
+    pub fn has_pending_bundles(&self) -> bool {
+        self.entries.iter().any(|e| e.status == "pending" || e.status == "processed" || e.status == "confirmed")
+    }
+
+    /// Advance commitment status of transactions based on slot finalization.
+    pub async fn advance_commitments_by_slot(&self, slot: u64, status: i32) {
+        let commitment = match status {
+            0 => "processed",
+            1 => "confirmed",
+            2 => "finalized",
+            _ => return,
+        };
+        
+        let mut updates = Vec::new();
+        for entry in self.entries.iter() {
+            if let Some(landed_slot) = entry.processed_slot {
+                if landed_slot <= slot {
+                    if Self::commitment_ord(commitment) > Self::commitment_ord(&entry.status) {
+                        updates.push((entry.bundle_id.clone(), commitment.to_string(), landed_slot));
+                    }
+                }
+            }
+        }
+        
+        for (bundle_id, comm, landed_slot) in updates {
+            self.update_status(&bundle_id, &comm, landed_slot).await;
         }
     }
 
@@ -320,6 +381,12 @@ impl LifecycleTracker {
         if let Some(bid) = bundle_id {
             self.update_status_failed(&bid, error_msg, slot).await;
         }
+    }
+
+    /// Retrieve a copy of a lifecycle entry using a transaction signature.
+    pub fn get_entry_by_sig(&self, signature: &str) -> Option<LifecycleEntry> {
+        let bundle_id = self.sig_to_bundle.get(signature).map(|r| r.clone())?;
+        self.entries.get(&bundle_id).map(|e| e.value().clone())
     }
 
     /// Record a failure for a specific bundle.

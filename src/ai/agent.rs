@@ -11,15 +11,24 @@ pub struct AiAgent {
     api_url: String,
     api_key: String,
     model: String,
+    fallback_url: Option<String>,
+    fallback_key: Option<String>,
+    fallback_model: Option<String>,
 }
 
 impl AiAgent {
     pub fn new(api_url: String, api_key: String, model: String) -> Self {
+        let fallback_url = std::env::var("AI_FALLBACK_API_URL").ok();
+        let fallback_key = std::env::var("AI_FALLBACK_API_KEY").ok();
+        let fallback_model = std::env::var("AI_FALLBACK_MODEL").ok();
         Self {
             client: Client::new(),
             api_url,
             api_key,
             model,
+            fallback_url,
+            fallback_key,
+            fallback_model,
         }
     }
 
@@ -30,11 +39,26 @@ impl AiAgent {
         let response = match self.call_llm(&prompt).await {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::error!("LLM API call failed: {:?}. Aborting AI decision loop.", e);
-                return Err(anyhow::anyhow!(
-                    "LLM API failed, cannot reason about failure: {:?}",
-                    e
-                ));
+                if self.fallback_url.is_some() && self.fallback_key.is_some() {
+                    info!("Primary LLM failed: {:?}. Attempting fallback LLM provider...", e);
+                    match self.call_fallback_llm(&prompt).await {
+                        Ok(resp) => resp,
+                        Err(fallback_err) => {
+                            tracing::error!("Fallback LLM also failed: {:?}", fallback_err);
+                            return Err(anyhow::anyhow!(
+                                "Both primary and fallback LLM failed. Primary error: {:?}, Fallback error: {:?}",
+                                e,
+                                fallback_err
+                            ));
+                        }
+                    }
+                } else {
+                    tracing::error!("LLM API call failed and no fallback configured: {:?}", e);
+                    return Err(anyhow::anyhow!(
+                        "LLM API failed, cannot reason about failure: {:?}",
+                        e
+                    ));
+                }
             }
         };
 
@@ -145,5 +169,50 @@ Output valid JSON only (no markdown, no explanation outside the JSON):
             .unwrap_or(content.trim())
             .trim()
             .to_string()
+    }
+
+    /// Call OpenAI-compatible fallback LLM
+    async fn call_fallback_llm(&self, prompt: &str) -> Result<String> {
+        let fallback_url = self.fallback_url.as_ref().ok_or_else(|| anyhow::anyhow!("No fallback URL"))?;
+        let fallback_key = self.fallback_key.as_ref().ok_or_else(|| anyhow::anyhow!("No fallback API key"))?;
+        let fallback_model = self.fallback_model.as_ref().cloned().unwrap_or_else(|| "grok-3-mini-fast".to_string());
+
+        let payload = serde_json::json!({
+            "model": fallback_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.0,
+            "response_format": { "type": "json_object" }
+        });
+
+        let res = self
+            .client
+            .post(fallback_url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", fallback_key))
+            .json(&payload)
+            .send()
+            .await?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let error_text = res.text().await?;
+            anyhow::bail!("Fallback LLM API error ({}): {}", status, error_text);
+        }
+
+        let resp_json: serde_json::Value = res.json().await?;
+        let content = resp_json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse fallback LLM response content"))?;
+
+        Ok(self.clean_json_response(content))
     }
 }

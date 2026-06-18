@@ -21,6 +21,7 @@ pub struct TipManager {
     jito_url: String,
     recent_priority_fees: Arc<RwLock<Vec<u64>>>,
     tip_account_balances: Arc<RwLock<Vec<u64>>>,
+    jito_percentile_75th: Arc<RwLock<Option<u64>>>,
     tip_accounts_cache: Arc<RwLock<Vec<Pubkey>>>,
     /// Timestamp of last tip account API fetch for cache staleness.
     tip_accounts_fetched_at: Arc<RwLock<Option<std::time::Instant>>>,
@@ -34,6 +35,7 @@ impl TipManager {
             jito_url: jito_url.to_string(),
             recent_priority_fees: Arc::new(RwLock::new(vec![])),
             tip_account_balances: Arc::new(RwLock::new(vec![])),
+            jito_percentile_75th: Arc::new(RwLock::new(None)),
             tip_accounts_cache: Arc::new(RwLock::new(vec![])),
             tip_accounts_fetched_at: Arc::new(RwLock::new(None)),
         }
@@ -142,59 +144,87 @@ impl TipManager {
         ])
     }
 
-    /// Calculate a truly dynamic tip using network congestion data and tip account activity.
-    pub async fn calculate_dynamic_tip(&self, base_lamports: u64) -> Result<u64> {
+    /// Return a snapshot of network conditions.
+    pub async fn get_network_snapshot(&self) -> crate::types::ai::NetworkSnapshot {
         let fees = self.recent_priority_fees.read().await;
         let balances = self.tip_account_balances.read().await;
 
-        // ── Signal 1: p75 of recent priority fees ──────────────────────
-        let (p75_fee, avg_fee, congestion_factor) = if fees.len() < 3 {
-            (base_lamports, base_lamports, 1.0)
+        let avg_fee = if !fees.is_empty() {
+            Some(fees.iter().sum::<u64>() / fees.len() as u64)
         } else {
+            None
+        };
+
+        let p75_fee = if !fees.is_empty() {
             let mut sorted = fees.clone();
             sorted.sort();
-            let p75_idx = (sorted.len() as f64 * 0.75) as usize;
-            let p75 = sorted[p75_idx.min(sorted.len() - 1)];
-            let avg = sorted.iter().sum::<u64>() / sorted.len() as u64;
+            let idx = (sorted.len() as f64 * 0.75) as usize;
+            Some(sorted[idx.min(sorted.len() - 1)])
+        } else {
+            None
+        };
 
-            // Congestion factor from coefficient of variation
+        let avg_balance = if !balances.is_empty() {
+            Some(balances.iter().sum::<u64>() / balances.len() as u64)
+        } else {
+            None
+        };
+
+        crate::types::ai::NetworkSnapshot {
+            avg_recent_priority_fee: avg_fee,
+            p75_recent_priority_fee: p75_fee,
+            avg_tip_account_balance: avg_balance,
+            current_dynamic_tip: self.calculate_dynamic_tip(300, 0).await.ok(),
+            slots_since_last_jito_leader: None,
+            recent_landing_rate_pct: None,
+        }
+    }
+
+    /// Calculate a truly dynamic tip using network congestion data, tip account activity, and retry count.
+    /// 
+    /// Solana priority fees are provided in micro-lamports per Compute Unit (CU).
+    /// To calculate the actual fee in lamports:
+    /// (micro-lamports per CU * expected CUs) / 1,000,000
+    pub async fn calculate_dynamic_tip(&self, compute_units: u64, retry_count: u32) -> Result<u64> {
+        let base_lamports = if let Some(tip) = *self.jito_percentile_75th.read().await {
+            tip as f64
+        } else {
+            let fees = self.recent_priority_fees.read().await;
+            let p75_micro_lamports_per_cu = if fees.len() < 3 {
+                0
+            } else {
+                let mut sorted = fees.clone();
+                sorted.sort();
+                let p75_idx = (sorted.len() as f64 * 0.75) as usize;
+                sorted[p75_idx.min(sorted.len() - 1)]
+            };
+            let expected_micro_lamports = p75_micro_lamports_per_cu as f64 * compute_units as f64;
+            expected_micro_lamports / 1_000_000.0
+        };
+
+        // Compute congestion factor from priority fee variance (if fees available)
+        let fees = self.recent_priority_fees.read().await;
+        let congestion_factor = if fees.len() >= 3 {
+            let avg = fees.iter().sum::<u64>() / fees.len() as u64;
             let mean_f = avg as f64;
             if mean_f > 0.0 {
-                let variance: f64 = sorted
+                let variance: f64 = fees
                     .iter()
                     .map(|&f| (f as f64 - mean_f).powi(2))
                     .sum::<f64>()
-                    / sorted.len() as f64;
+                    / fees.len() as f64;
                 let cv = variance.sqrt() / mean_f;
-                // cv < 0.5 → low congestion (factor ~1.0)
-                let factor = (1.0 + cv * 0.5).min(2.5);
-                (p75, avg, factor)
+                (1.0 + cv * 0.5).min(2.5)
             } else {
-                (p75, avg, 1.0)
+                1.0
             }
-        };
-
-        // ── Signal 2: Tip account balance activity ─────────────────────
-        let tip_pressure = if balances.is_empty() {
+        } else {
             1.0
-        } else {
-            let avg_balance = balances.iter().sum::<u64>() / balances.len() as u64;
-            let sol = avg_balance as f64 / 1_000_000_000.0;
-            // Higher accumulated balance → more active competition → increase tip
-            (1.0 + sol * 0.1).min(2.0)
         };
 
-        let avg_balance_for_log = if balances.is_empty() {
-            None
-        } else {
-            Some(balances.iter().sum::<u64>() / balances.len() as u64)
-        };
-
-        // Combine signals: use p75 as baseline, multiply by dynamic congestion and tip pressure
-        let computed = (p75_fee as f64 * congestion_factor * tip_pressure)
-            .max(base_lamports as f64)
-            .max(MIN_TIP_LAMPORTS as f64) as u64;
-        let dynamic_tip = computed.min(MAX_TIP_LAMPORTS);
+        let retry_scaling = 1.0 + (retry_count as f64 * 0.15);
+        let computed = (base_lamports * congestion_factor * retry_scaling) as u64;
+        let dynamic_tip = computed.max(MIN_TIP_LAMPORTS).min(MAX_TIP_LAMPORTS);
 
         if computed > MAX_TIP_LAMPORTS {
             warn!(
@@ -204,8 +234,8 @@ impl TipManager {
         }
 
         info!(
-            "Dynamic tip: {} lamports (p75_fee={}, avg_fee={}, congestion={:.2}, tip_pressure={:.2}, fees_sampled={}, avg_balance={:?})",
-            dynamic_tip, p75_fee, avg_fee, congestion_factor, tip_pressure, fees.len(), avg_balance_for_log
+            "Dynamic tip: {} lamports (base={}, congestion={:.2}, retry={})",
+            dynamic_tip, base_lamports, congestion_factor, retry_count
         );
 
         Ok(dynamic_tip)
@@ -239,18 +269,19 @@ impl TipManager {
             Some(balances.iter().sum::<u64>() / balances.len() as u64)
         };
 
-        let current_tip = self.calculate_dynamic_tip(100_000).await.ok();
+        let current_tip = self.calculate_dynamic_tip(200_000, 0).await.ok();
 
         (avg_fee, p75_fee, avg_balance, current_tip)
     }
 
     /// Start background task to periodically update tip data from real sources.
     pub async fn start_tip_updater(&self) {
-        info!("Tip updater started (10s interval, dual-signal: priority fees + tip account balances)");
+        info!("Tip updater started (10s interval, dual-signal: priority fees + Jito tips API)");
         let rpc_client = self.rpc_client.clone();
         let recent_fees = self.recent_priority_fees.clone();
-        let tip_balances = self.tip_account_balances.clone();
-        let tip_accounts_cache = self.tip_accounts_cache.clone();
+        let jito_percentile_75th = self.jito_percentile_75th.clone();
+        let http_client = self.http_client.clone();
+        let jito_url = self.jito_url.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -274,30 +305,30 @@ impl TipManager {
                     }
                 }
 
-                // Source 2: Jito tip account balances (real tip account data)
-                let accounts = tip_accounts_cache.read().await.clone();
-                if !accounts.is_empty() {
-                    let subset: Vec<Pubkey> = accounts.iter().take(8).cloned().collect();
-                    match rpc_client.get_multiple_accounts(&subset).await {
-                        Ok(accs) => {
-                            let balances: Vec<u64> = accs
-                                .into_iter()
-                                .filter_map(|a| a.map(|acc| acc.lamports))
-                                .collect();
-                            if !balances.is_empty() {
-                                tracing::debug!(
-                                    "Updated tip account balances: {} accounts sampled",
-                                    balances.len()
-                                );
-                                *tip_balances.write().await = balances;
+                // Source 2: Jito tips REST API
+                let tips_url = format!("{}/api/v1/tips", jito_url.trim_end_matches('/'));
+                match http_client.get(&tips_url).send().await {
+                    Ok(res) => {
+                        if res.status().is_success() {
+                            if let Ok(metrics) = res.json::<Vec<serde_json::Value>>().await {
+                                if let Some(latest) = metrics.first() {
+                                    if let Some(val_75th) = latest.get("landed_tips_75th_percentile").and_then(|v| v.as_f64()) {
+                                        let tip_lamports = if val_75th > 1.0 {
+                                            val_75th as u64
+                                        } else {
+                                            (val_75th * 1_000_000_000.0) as u64
+                                        };
+                                        tracing::debug!("Updated 75th percentile Jito tip from API: {} lamports", tip_lamports);
+                                        *jito_percentile_75th.write().await = Some(tip_lamports);
+                                    }
+                                }
                             }
+                        } else {
+                            tracing::debug!("Jito tips API returned status: {}", res.status());
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                "Failed to query tip account balances: {}",
-                                e
-                            );
-                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to fetch Jito tips from API: {}", e);
                     }
                 }
             }
