@@ -194,7 +194,7 @@ For every bundle the tracker stores:
 5.5 AI Agent
 Purpose
 The AI Agent owns operational decision making inside the transaction stack.
-Unlike purely deterministic retry systems, the agent evaluates transaction failures and determines how the system should respond by calling an LLM (Gemini 2.5 Flash).
+Unlike purely deterministic retry systems, the agent evaluates transaction failures and determines how the system should respond by calling an LLM (Gemini, Grok, OpenAI, or Ollama).
 
 Inputs
 The AI agent receives a Failure Context containing:
@@ -226,7 +226,7 @@ The failure recovery loop implements an exact sequence of steps to handle unconf
    - If the AI returns `retry_higher_tip`, a new intent is queued with the suggested higher tip.
    - If the AI returns `wait`, the system queues an intent with a target slot (current slot + wait_slots).
    - If the AI returns `abort`, the intent is dropped.
-5. **Deterministic Fallback:** If the AI API request fails, times out, or returns invalid JSON, the system falls back to a deterministic routine: it queues a retry with a refreshed blockhash, a 1.5x tip multiplier, and delays submission by 5 slots.
+5. **Deterministic Fallback:** If the AI API request fails, times out, or returns invalid JSON, the system falls back to a deterministic routine: it queues a retry with a refreshed blockhash and a 1.5x tip multiplier.
 6. **Re-Submission:** The Orchestrator pops the new intent and waits until the target slot is reached and a Jito leader is active in the upcoming 4 slots. If a Jito window is not found within 5 slots of the target, the bundle is submitted anyway as a fallback.
 
 7. Infrastructure Design Decisions

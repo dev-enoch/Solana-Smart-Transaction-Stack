@@ -76,37 +76,32 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
 
 The delta between `processed_at` and `confirmed_at` is a strong real-time indicator of network congestion and fork stability.
 
-In our runs:
+Under healthy network conditions:
+- The delta is typically **200–800ms** (a few slots), signaling rapid validator voting and fast consensus.
+- Under high congestion, the delta stretches to **2–6 seconds** as vote propagation slows down across the cluster and fork churn increases.
 
-- On healthy/low-congestion periods, the delta was typically **200–800ms** (a few slots). This shows quick supermajority voting and stable block propagation.
-- During higher load (observed via slot timing and tip pressure), the delta stretched to **2–6 seconds**. This signals increased fork churn or slower vote propagation across the cluster.
-
-Large deltas (>3s) correlated with higher bundle failure rates on retry, prompting our AI agent to increase tips or delay submission until the next favorable leader window. This metric proved more actionable than raw slot count for operational decisions.
+Monitoring this delta in production allows the tracker to detect when cluster consensus is lagging, informing retry tip scaling and submission pacing decisions.
 
 ### Why should you never use `finalized` commitment when fetching a blockhash for a time-sensitive transaction?
 
-Because `finalized` commitment lags significantly behind the tip of the chain (typically 31+ slots / ~12–15 seconds).
+Because `finalized` commitment lags significantly behind the tip of the chain (typically 31+ slots / ~12–15 seconds). A transaction signed with a `finalized` blockhash loses about 15 seconds of its ~60-second lifetime, increasing blockhash expiry risk.
 
-A transaction signed with a `finalized` blockhash has a much shorter remaining validity window (~150 slots total lifetime). This dramatically increases the risk of **blockhash expiry** before the bundle even reaches a Jito leader, especially under any network delay.
+Furthermore, we observed that using `confirmed` commitment can still lead to immediate expiry failures when querying lagged public RPC endpoints. If the public RPC load balancer routes the blockhash request to a lagging node but the block height check hits a caught-up node, the stack will instantly flag the blockhash as expired. 
 
-In our tests, using `confirmed` for `getLatestBlockhash` gave us ~10–15 extra seconds of validity compared to `finalized`, which directly improved landing rates. Our AI agent explicitly chooses `confirmed` for blockhash refreshes during retries.
+To mitigate this, our stack fetches blockhashes using the **`processed` commitment level** (the absolute tip) and caches/throttles block height queries (polling at most once every 2 seconds) to guarantee consistency and maximize the validity window.
 
 ### What happens to your bundle if the Jito leader skips their slot?
 
-If the assigned Jito leader skips their slot (uncled block / missed leader), the bundle is **not landed** in that slot.
+If the Jito leader skips their slot, the bundle is **not landed** in that slot. Because bundles are tied to a specific leader's bundle stage, a skipped slot causes the block engine to discard the bundle.
 
-Because bundles are tied to a specific leader's BundleStage, a skipped slot causes the bundle to be dropped or flushed from the Block Engine queue. In our logs, this manifested as a "bundle_drop" or timeout failure with no `processed` status.
-
-Our AI agent detects this (via missing commitment updates + slot progression) and triggers an autonomous retry with a refreshed blockhash and adjusted (usually higher) tip for the next available Jito leader window. This behavior was one of the most common failure modes we observed and handled.
+Our system handles this by detecting missing commitment updates and executing an autonomous retry with a refreshed blockhash and adjusted tip for the next Jito leader window.
 
 ## Key Observations & Tradeoffs
 
-- **gRPC Reconnection:** Essential for stability. Reconnections cause tiny gaps in slot data, requiring the tracker to gracefully handle missing intermediate slots. Our exponential backoff strategy (1s to 30s cap) prevents log flooding during sustained outages.
-- **Dynamic Tips vs Cost:** Dynamically scaling tips based on a dual-signal approach (recent priority fees + tip account balances) vastly improved landing rates during congestion. The hard cap at 0.05 SOL (`MAX_TIP_LAMPORTS = 50,000,000`) prevents runaway costs.
-- **AI Reasoning Quality:** Giving the LLM full visibility into latency and exact failure types resulted in surprisingly pragmatic operational decisions. Passing detailed JSON context was key. The agent consistently chose `refresh_blockhash` for expiry failures and `retry_higher_tip` for congestion-related drops.
-- **Retry Budget:** Capping retries at 3 per bundle chain (`MAX_RETRIES`) proved essential during testing — without it, the AI would keep retrying indefinitely during sustained network issues, escalating tips without bound.
-- **Fallback Submission:** The 100-slot fallback window (`MAX_WAIT_SLOTS`) was critical for devnet testing where Jito validators may not be present in the leader schedule. Without it, the intent queue would stall permanently.
-- **Secondary Confirmation:** Polling `getSignatureStatuses` every 8 seconds caught commitment updates that the gRPC stream occasionally missed during brief reconnection windows. This dual-path approach significantly improved tracking accuracy.
+- **RPC Load Balancer Lag:** Public RPC nodes (like the default mainnet endpoint) frequently return stale blockhashes. Fetching with `processed` commitment is crucial to prevent instant blockhash expiry.
+- **Throttling RPC Calls:** Throttling block height checks to once every 2 seconds prevents rate-limiting issues on the RPC node while maintaining accurate tracking.
+- **Tip Account Randomization:** Randomly distributing tips across all 8 Jito tip accounts prevents concentration of funds and adheres to Jito guidelines.
+- **Fallback Resilience:** Restoring deterministic fallback (1.5x tip and refreshed blockhash) ensures that if the LLM API experiences rate limits or credentials are depleted, transactions are not aborted and can still land.
 
 ## License
 

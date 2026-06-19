@@ -243,6 +243,8 @@ async fn main() -> Result<()> {
 
     info!("Entering main event loop...");
     let mut last_submission = tokio::time::Instant::now() - std::time::Duration::from_secs(5);
+    let mut cached_block_height = 0;
+    let mut last_height_check = tokio::time::Instant::now() - std::time::Duration::from_secs(10);
 
     while let Some(event) = event_rx.recv().await {
         match event {
@@ -252,9 +254,19 @@ async fn main() -> Result<()> {
                 tracker.advance_commitments_by_slot(current_slot, update.status).await;
 
                 if tracker.has_pending_bundles() {
-                    let block_height = match update.block_height {
-                        Some(bh) => bh,
-                        None => rpc_client.get_block_height().await.unwrap_or(0),
+                    let block_height = if let Some(bh) = update.block_height {
+                        bh
+                    } else if cached_block_height == 0 || last_height_check.elapsed().as_secs() >= 2 {
+                        match rpc_client.get_block_height().await {
+                            Ok(bh) => {
+                                cached_block_height = bh;
+                                last_height_check = tokio::time::Instant::now();
+                                bh
+                            }
+                            Err(_) => cached_block_height,
+                        }
+                    } else {
+                        cached_block_height
                     };
 
                     if block_height > 0 {
@@ -471,16 +483,38 @@ async fn main() -> Result<()> {
 
                         if trigger_fallback {
                             info!(
-                                "AI failure/fallback triggered and deterministic fallback is disabled. Aborting bundle chain {}.",
+                                "AI failure/fallback triggered. Activating deterministic fallback retry for {}.",
                                 bundle_id
                             );
-                            log.log(&OperationalEvent::FailureDetected {
+                            let new_id = format!("{}_retry_fallback", bundle_id);
+                            let new_tip = (tip as f64 * 1.5) as u64;
+                            let new_history = format!(
+                                "{} | [Retry {}] Failed with {}. AI fallback activated: refreshed blockhash, 1.5x tip.",
+                                ctx_history_summary,
+                                ctx_retry_count,
+                                ctx_failure_type
+                            );
+                            let new_intent = Intent {
+                                id: new_id.clone(),
+                                memo: "smart-stack retry (deterministic fallback)".to_string(),
+                                retries: next_retry,
+                                override_tip: Some(new_tip),
+                                fault_injection: None,
+                                target_slot: None,
+                                queued_at_slot: None,
+                                history_summary: new_history,
+                            };
+
+                            log.log(&OperationalEvent::RetryQueued {
                                 timestamp: Utc::now(),
-                                bundle_id: bundle_id.clone(),
-                                failure_type: "aborted_no_fallback".to_string(),
-                                slot: current_slot,
-                                details: format!("AI reasoning failed: {}. Aborted due to fallback removal policy.", llm_error_msg),
-                            }).await;
+                                original_bundle_id: bundle_id.clone(),
+                                new_intent_id: new_id,
+                                reason: format!("AI fallback: LLM unavailable ({})", llm_error_msg),
+                                new_tip: Some(new_tip),
+                            })
+                            .await;
+
+                            q.lock().await.push_back(new_intent);
                         }
                     }.instrument(tracing::Span::current()));
                 }
@@ -830,16 +864,38 @@ async fn main() -> Result<()> {
 
                                 if trigger_fallback {
                                     info!(
-                                        "AI failure/fallback triggered and deterministic fallback is disabled. Aborting bundle chain {}.",
+                                        "AI failure/fallback triggered. Activating deterministic fallback retry for {}.",
                                         bundle_id
                                     );
-                                    log.log(&OperationalEvent::FailureDetected {
+                                    let new_id = format!("{}_retry_fallback", bundle_id);
+                                    let new_tip = (entry.tip_lamports as f64 * 1.5) as u64;
+                                    let new_history = format!(
+                                        "{} | [Retry {}] Failed with {}. AI fallback activated: refreshed blockhash, 1.5x tip.",
+                                        ctx_history_summary,
+                                        ctx_retry_count,
+                                        ctx_failure_type
+                                    );
+                                    let new_intent = Intent {
+                                        id: new_id.clone(),
+                                        memo: "smart-stack retry (deterministic fallback)".to_string(),
+                                        retries: next_retry,
+                                        override_tip: Some(new_tip),
+                                        fault_injection: None,
+                                        target_slot: None,
+                                        queued_at_slot: None,
+                                        history_summary: new_history,
+                                    };
+
+                                    log.log(&OperationalEvent::RetryQueued {
                                         timestamp: Utc::now(),
-                                        bundle_id: bundle_id.clone(),
-                                        failure_type: "aborted_no_fallback".to_string(),
-                                        slot: current_slot,
-                                        details: format!("AI reasoning failed: {}. Aborted due to fallback removal policy.", llm_error_msg),
-                                    }).await;
+                                        original_bundle_id: bundle_id.clone(),
+                                        new_intent_id: new_id,
+                                        reason: format!("AI fallback: LLM unavailable ({})", llm_error_msg),
+                                        new_tip: Some(new_tip),
+                                    })
+                                    .await;
+
+                                    q.lock().await.push_back(new_intent);
                                 }
                             });
                         }

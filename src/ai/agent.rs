@@ -4,7 +4,29 @@ use tracing::info;
 
 use crate::types::ai::{AgentDecision, FailureContext};
 
-/// AI Agent that makes autonomous operational decisions for failure recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderType {
+    Gemini,
+    OpenAi,
+    Grok,
+    Ollama,
+}
+
+impl ProviderType {
+    pub fn detect(url: &str) -> Self {
+        let lower = url.to_lowercase();
+        if lower.contains("googleapis.com") || lower.contains("generativelanguage") {
+            Self::Gemini
+        } else if lower.contains("x.ai") {
+            Self::Grok
+        } else if lower.contains("localhost") || lower.contains("127.0.0.1") || lower.contains("11434") || lower.contains("ollama") {
+            Self::Ollama
+        } else {
+            Self::OpenAi
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AiAgent {
     client: Client,
@@ -32,50 +54,40 @@ impl AiAgent {
         }
     }
 
-    /// Core method: Agent makes autonomous decision about a failure.
     pub async fn decide_on_failure(&self, failure_context: FailureContext) -> Result<AgentDecision> {
         let prompt = self.build_failure_reasoning_prompt(&failure_context);
 
-        let response = match self.call_llm(&prompt).await {
+        let response = match self.call_llm_endpoint(&self.api_url, &self.api_key, &self.model, &prompt).await {
             Ok(resp) => resp,
             Err(e) => {
-                if self.fallback_url.is_some() && self.fallback_key.is_some() {
-                    info!("Primary LLM failed: {:?}. Attempting fallback LLM provider...", e);
-                    match self.call_fallback_llm(&prompt).await {
+                if let (Some(fallback_url), Some(fallback_key)) = (&self.fallback_url, &self.fallback_key) {
+                    let fallback_model = self.fallback_model.as_deref().unwrap_or("grok-3-mini-fast");
+                    info!("Primary LLM failed: {:?}. Attempting fallback LLM...", e);
+                    match self.call_llm_endpoint(fallback_url, fallback_key, fallback_model, &prompt).await {
                         Ok(resp) => resp,
                         Err(fallback_err) => {
                             tracing::error!("Fallback LLM also failed: {:?}", fallback_err);
-                            return Err(anyhow::anyhow!(
-                                "Both primary and fallback LLM failed. Primary error: {:?}, Fallback error: {:?}",
-                                e,
-                                fallback_err
-                            ));
+                            return Err(anyhow::anyhow!("Primary error: {:?}, Fallback: {:?}", e, fallback_err));
                         }
                     }
                 } else {
-                    tracing::error!("LLM API call failed and no fallback configured: {:?}", e);
-                    return Err(anyhow::anyhow!(
-                        "LLM API failed, cannot reason about failure: {:?}",
-                        e
-                    ));
+                    tracing::error!("LLM API call failed: {:?}", e);
+                    return Err(anyhow::anyhow!("LLM failed: {:?}", e));
                 }
             }
         };
 
         let decision: AgentDecision = serde_json::from_str(&response)
-            .map_err(|e| anyhow::anyhow!("Failed to parse LLM JSON response: {} — raw: {}", e, response))?;
-        info!(
-            "AI Decision — Reasoning: {}\n  Action: {} | New tip: {:?} | Wait: {:?}",
-            decision.reasoning, decision.action, decision.new_tip_lamports, decision.wait_slots
-        );
+            .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {} - error: {}", response, e))?;
+        info!("AI Decision: {} -> {}", decision.reasoning, decision.action);
         Ok(decision)
     }
 
     fn build_failure_reasoning_prompt(&self, ctx: &FailureContext) -> String {
         let history_block = if ctx.history_summary.trim().is_empty() {
-            "No previous retry history for this intent.".to_string()
+            "No previous retry history for this intent."
         } else {
-            ctx.history_summary.clone()
+            &ctx.history_summary
         };
 
         format!(
@@ -112,53 +124,122 @@ Output valid JSON only (no markdown, no explanation outside the JSON):
         )
     }
 
-    /// Call the Gemini LLM.
-    async fn call_llm(&self, prompt: &str) -> Result<String> {
-        self.call_gemini(prompt).await
-    }
+    async fn call_llm_endpoint(&self, url: &str, key: &str, model: &str, prompt: &str) -> Result<String> {
+        let provider = ProviderType::detect(url);
+        match provider {
+            ProviderType::Gemini => {
+                let payload = serde_json::json!({
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "systemInstruction": {
+                        "parts": [{"text": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."}]
+                    },
+                    "generationConfig": {
+                        "temperature": 0.0,
+                        "responseMimeType": "application/json"
+                    }
+                });
 
-    /// Gemini format
-    async fn call_gemini(&self, prompt: &str) -> Result<String> {
-        let payload = serde_json::json!({
-            "contents": [{"parts": [{"text": prompt}]}],
-            "systemInstruction": {
-                "parts": [{"text": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."}]
-            },
-            "generationConfig": {
-                "temperature": 0.0,
-                "responseMimeType": "application/json"
+                let request_url = if url.contains('?') {
+                    format!("{}&key={}", url, key)
+                } else {
+                    format!("{}?key={}", url, key)
+                };
+
+                let res = self.client.post(&request_url)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await?;
+
+                let status = res.status();
+                if !status.is_success() {
+                    let err = res.text().await?;
+                    anyhow::bail!("Gemini API error ({}): {}", status, err);
+                }
+
+                let resp_json: serde_json::Value = res.json().await?;
+                let content = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse Gemini response"))?;
+
+                Ok(self.clean_json_response(content))
             }
-        });
+            ProviderType::OpenAi | ProviderType::Grok => {
+                let payload = serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    "temperature": 0.0,
+                    "response_format": { "type": "json_object" }
+                });
 
-        let url = if self.api_url.contains('?') {
-            format!("{}&key={}", self.api_url, self.api_key)
-        } else {
-            format!("{}?key={}", self.api_url, self.api_key)
-        };
+                let res = self.client.post(url)
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", key))
+                    .json(&payload)
+                    .send()
+                    .await?;
 
-        let res = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
+                let status = res.status();
+                if !status.is_success() {
+                    let err = res.text().await?;
+                    anyhow::bail!("LLM API error ({}): {}", status, err);
+                }
 
-        let status = res.status();
-        if !status.is_success() {
-            let error_text = res.text().await?;
-            anyhow::bail!("Google LLM API error ({}): {}", status, error_text);
+                let resp_json: serde_json::Value = res.json().await?;
+                let content = resp_json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse LLM response"))?;
+
+                Ok(self.clean_json_response(content))
+            }
+            ProviderType::Ollama => {
+                let payload = serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    "stream": false,
+                    "format": "json"
+                });
+
+                let res = self.client.post(url)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await?;
+
+                let status = res.status();
+                if !status.is_success() {
+                    let err = res.text().await?;
+                    anyhow::bail!("Ollama error ({}): {}", status, err);
+                }
+
+                let resp_json: serde_json::Value = res.json().await?;
+                let content = resp_json["message"]["content"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse Ollama response"))?;
+
+                Ok(self.clean_json_response(content))
+            }
         }
-
-        let resp_json: serde_json::Value = res.json().await?;
-        let content = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Failed to parse Google LLM response content"))?;
-
-        Ok(self.clean_json_response(content))
     }
 
-    /// Strip markdown code block wrappers that LLMs sometimes add despite instructions.
     fn clean_json_response(&self, content: &str) -> String {
         content
             .trim()
@@ -170,49 +251,5 @@ Output valid JSON only (no markdown, no explanation outside the JSON):
             .trim()
             .to_string()
     }
-
-    /// Call OpenAI-compatible fallback LLM
-    async fn call_fallback_llm(&self, prompt: &str) -> Result<String> {
-        let fallback_url = self.fallback_url.as_ref().ok_or_else(|| anyhow::anyhow!("No fallback URL"))?;
-        let fallback_key = self.fallback_key.as_ref().ok_or_else(|| anyhow::anyhow!("No fallback API key"))?;
-        let fallback_model = self.fallback_model.as_ref().cloned().unwrap_or_else(|| "grok-3-mini-fast".to_string());
-
-        let payload = serde_json::json!({
-            "model": fallback_model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a Solana transaction agent. Respond ONLY with valid JSON. Do not use markdown code blocks, just raw JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "temperature": 0.0,
-            "response_format": { "type": "json_object" }
-        });
-
-        let res = self
-            .client
-            .post(fallback_url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", fallback_key))
-            .json(&payload)
-            .send()
-            .await?;
-
-        let status = res.status();
-        if !status.is_success() {
-            let error_text = res.text().await?;
-            anyhow::bail!("Fallback LLM API error ({}): {}", status, error_text);
-        }
-
-        let resp_json: serde_json::Value = res.json().await?;
-        let content = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Failed to parse fallback LLM response content"))?;
-
-        Ok(self.clean_json_response(content))
-    }
 }
+

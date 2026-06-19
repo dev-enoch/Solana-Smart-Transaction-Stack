@@ -55,4 +55,46 @@ mod tests {
             assert!(!schedule);
         }
     }
+
+    #[test]
+    fn test_provider_type_detection() {
+        use crate::ai::agent::ProviderType;
+        assert_eq!(ProviderType::detect("https://generativelanguage.googleapis.com/v1beta"), ProviderType::Gemini);
+        assert_eq!(ProviderType::detect("https://api.x.ai/v1/chat/completions"), ProviderType::Grok);
+        assert_eq!(ProviderType::detect("http://localhost:11434/api/chat"), ProviderType::Ollama);
+        assert_eq!(ProviderType::detect("https://api.openai.com/v1/chat/completions"), ProviderType::OpenAi);
+    }
+
+    #[tokio::test]
+    async fn test_advance_commitments_by_slot() {
+        let tracker = LifecycleTracker::new(
+            "test_lifecycle_logs.json",
+            crate::logging::StructuredLogger::new("test_operational_events.jsonl").unwrap(),
+            Arc::new(RpcClient::new("https://api.devnet.solana.com".to_string())),
+        );
+
+        tracker.record_submission(
+            "intent_1".to_string(),
+            "bundle_1".to_string(),
+            100,
+            150000,
+            vec!["sig1".to_string()],
+            200,
+            0,
+            "".to_string(),
+            None,
+        ).await;
+
+        tracker.update_status("bundle_1", "processed", 102).await;
+        let entry = tracker.get_entry_by_sig("sig1").unwrap();
+        assert_eq!(entry.status, "processed");
+        assert_eq!(entry.processed_slot, Some(102));
+
+        tracker.advance_commitments_by_slot(105, 1).await;
+        let entry = tracker.get_entry_by_sig("sig1").unwrap();
+        assert_eq!(entry.status, "confirmed");
+
+        let _ = std::fs::remove_file("test_lifecycle_logs.json");
+        let _ = std::fs::remove_file("test_operational_events.jsonl");
+    }
 }

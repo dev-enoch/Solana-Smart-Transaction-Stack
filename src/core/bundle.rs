@@ -42,11 +42,8 @@ impl BundleBuilder {
     ) -> Result<(String, Vec<String>, u64, u64)> {
         let tip_account = self
             .tip_manager
-            .get_tip_accounts()
-            .await?
-            .first()
-            .cloned()
-            .ok_or_else(|| anyhow!("No tip accounts available"))?;
+            .select_random_tip_account()
+            .await?;
 
         // Use AI-recommended tip if provided, otherwise calculate dynamically
         let tip_lamports = match override_tip {
@@ -66,11 +63,11 @@ impl BundleBuilder {
             tip_lamports, tip_account
         );
 
-        // Fetch fresh blockhash with confirmed commitment for maximum validity window.
+        // Fetch fresh blockhash with processed commitment for minimum validity lag.
         let (blockhash, last_valid_block_height) = self
             .rpc_client
             .get_latest_blockhash_with_commitment(
-                solana_sdk::commitment_config::CommitmentConfig::confirmed(),
+                solana_sdk::commitment_config::CommitmentConfig::processed(),
             )
             .await
             .map_err(|e| anyhow!("Failed to get latest blockhash: {}", e))?;
