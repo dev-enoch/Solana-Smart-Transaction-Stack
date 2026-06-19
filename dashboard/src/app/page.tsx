@@ -47,7 +47,7 @@ function DashboardContent() {
   
   const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
 
-  const limit = 15;
+  const limit = 10;
 
   // Sync URL when state changes
   useEffect(() => {
