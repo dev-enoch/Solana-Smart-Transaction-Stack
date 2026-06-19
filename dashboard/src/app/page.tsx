@@ -2,7 +2,9 @@
 
 import { useEffect, useState, Suspense } from "react";
 import { useRouter, useSearchParams, usePathname } from "next/navigation";
-import { Search, Inbox, LayoutDashboard, Activity, Zap, X } from 'lucide-react';
+import { Search, Inbox, LayoutDashboard, Activity, Zap, X, Menu } from 'lucide-react';
+
+
 
 type Stats = {
   lifecycle: {
@@ -25,8 +27,7 @@ function DashboardContent() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-
-  // Initialize state from URL or defaults
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"lifecycle" | "operational">(
     (searchParams.get("tab") as "lifecycle" | "operational") || "lifecycle"
   );
@@ -131,6 +132,7 @@ function DashboardContent() {
     setSearchInput("");
     setSelectedLog(null);
     setLogs([]);
+    setSidebarOpen(false);
   };
 
   const handleFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -154,9 +156,19 @@ function DashboardContent() {
 
   return (
     <div className="app-layout">
+      {/* Mobile Sidebar Overlay */}
+      {sidebarOpen && (
+        <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)}></div>
+      )}
+
       {/* Sidebar */}
-      <aside className="sidebar">
-        <div className="sidebar-title">Smart Tx Stack</div>
+      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
+        <div className="sidebar-header">
+          <div className="sidebar-title">Smart Tx Stack</div>
+          <button className="btn-close-sidebar" onClick={() => setSidebarOpen(false)}>
+            <X size={18} />
+          </button>
+        </div>
         <div className="nav-menu">
           <div 
             className={`nav-item ${activeTab === "lifecycle" ? "active" : ""}`}
@@ -172,6 +184,14 @@ function DashboardContent() {
           </div>
         </div>
       </aside>
+
+      {/* Mobile Navigation Header */}
+      <div className="mobile-navbar">
+        <button className="btn-menu" onClick={() => setSidebarOpen(true)}>
+          <Menu size={22} />
+        </button>
+        <div className="mobile-navbar-title">Smart Tx Stack</div>
+      </div>
 
       {/* Main Content */}
       <main className="main-content">
