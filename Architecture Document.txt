@@ -206,6 +206,7 @@ The AI agent receives a Failure Context containing:
 - Transaction latency
 - Extra contextual details
 - Detailed retry history for the bundle chain
+- Network snapshot (recent priority fees, tip accounts, Jito leader distance, landing rates)
 
 Outputs
 The agent outputs structured JSON with its reasoning, root cause, and the next best action:
@@ -275,16 +276,17 @@ Future Improvements
 - Expand transaction support to dynamically adjust slippage parameters for DEX swaps during retry loops.
 - Implement RPC endpoint failover for blockhash fetching.
 
-9. Benchmark Methodology
-No concrete performance benchmarks have been collected yet. Future experiments should measure latency using the following methodology:
+9. Benchmark Methodology & Active Telemetry
+The stack natively implements real-time performance benchmarking through the Tracking and Observability Layer. 
 
-To measure the end-to-end performance and effectiveness of the stack, record the exact Unix timestamp at each of these stages:
-1. **Creation Time:** When the intent is generated in the application.
-2. **Submission Time:** When the Jito JSON-RPC returns a successful bundle ID.
-3. **Processed Time:** When the Yellowstone stream emits a `processed` event for the transaction signature.
-4. **Confirmed Time:** When the secondary RPC or stream emits a `confirmed` or `finalized` status.
+For every transaction bundle, the system actively records the exact Unix timestamp at each of these stages and persists them to `lifecycle_logs.json`:
+1. **Creation Time:** (`submitted_at`) When the intent is generated and submitted.
+2. **Processed Time:** (`processed_at`) When the Yellowstone stream emits a `processed` event.
+3. **Confirmed Time:** (`confirmed_at`) When the secondary RPC or stream emits a `confirmed` status.
+4. **Finalized Time:** (`finalized_at`) When the transaction is `finalized`.
 
-Metrics to calculate from these timestamps:
-- **Time to Inclusion:** Processed Time - Submission Time (measures network propagation and Jito effectiveness).
-- **AI Decision Latency:** Time taken by the LLM API to respond with a retry strategy after a failure is detected.
-- **Cost Efficiency (Tip ROI):** Correlate the Tip Amount (lamports) against the Time to Inclusion to determine if dynamic tip algorithms are overpaying.
+The system automatically calculates and exports the following metrics:
+- **Time to Inclusion:** (`latency_processed_ms`) Measures network propagation and Jito Block Engine effectiveness.
+- **Time to Confirmation:** (`latency_confirmed_ms`) Measures the cluster voting latency.
+- **Cost Efficiency (Tip ROI):** By co-locating the `tip_lamports` with the latency metrics in the logs, developers can effortlessly correlate dynamic tip algorithms against actual inclusion times to ensure the system is not overpaying.
+- **AI Decision Latency:** Operational events track the exact time an AI strategy is produced and executed following a failure.
