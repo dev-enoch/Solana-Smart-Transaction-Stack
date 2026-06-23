@@ -50,7 +50,9 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
    - `JITO_BLOCK_ENGINE_URL`: Standard Jito endpoints (e.g. `amsterdam.mainnet.block-engine.jito.wtf`). Check the [Jito Docs](https://jito-foundation.gitbook.io/mev) for regional URLs.
    - `JITO_VALIDATORS`: Real Jito validator identity pubkeys. You can query the Jito API or block explorers to find active Jito validators.
    - `PRIVATE_KEY`: Generate a testing keypair via `cargo run --bin keygen` (devnet funded) or export a byte array from Phantom/Solflare for mainnet testing. Ensure the wallet has SOL on the network you intend to test.
-   - `AI_API_KEY`: Get an API key from [xAI](https://console.x.ai), [Google AI Studio](https://aistudio.google.com), or [OpenAI](https://platform.openai.com).
+   - `AI_API_KEY` or `GEMINI_API_KEY`: Get an API key from [xAI](https://console.x.ai), [Google AI Studio](https://aistudio.google.com), or [OpenAI](https://platform.openai.com).
+   - `AI_MODEL`: Set to the specific model string (e.g., `gemini-2.5-flash`).
+   - `AI_API_URL`: Set to the corresponding API endpoint (e.g., `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`).
 
 3. **Generate a Keypair (if needed)**
    ```bash
@@ -69,6 +71,17 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
    - Track lifecycle progression across all commitment levels
    - Invoke the AI agent for failure recovery decisions
    - Persist lifecycle logs to `lifecycle_logs.json` and operational events to `operational_events.jsonl`
+
+5. **Run the Dashboard**
+   In a separate terminal, navigate to the dashboard directory, install dependencies, and start the Next.js real-time monitoring dashboard:
+
+   ```bash
+   cd dashboard
+   yarn install
+   yarn dev
+   ```
+   
+   The dashboard will be available at `http://localhost:3000`.
 
 ## Design Questions & Observations
 
