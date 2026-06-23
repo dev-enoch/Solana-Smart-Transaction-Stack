@@ -21,7 +21,7 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
 - **AI-Driven Failure Recovery** — LLM-powered chain-of-thought reasoning for failure diagnosis and autonomous retry decisions
 - **Failure Classification** — Automatic categorization of errors: `expired_blockhash`, `insufficient_funds`, `compute_exceeded`, `bundle_failure`, `already_processed`
 - **Retry Cap & Circuit Breaker** — Maximum 3 retries per bundle chain to prevent runaway tip escalation
-- **Fallback Submission** — Automatic submission after 100 slots if no Jito leader window is available, preventing queue starvation
+- **Dual-Submission Fallback** — Simultaneously submits transactions via standard RPC (`send_transaction` with `skip_preflight: true`) to guarantee inclusion even if the Jito bundle is dropped or Jito leaders are scarce.
 - **Secondary Confirmation** — `getSignatureStatuses` RPC polling every 8 seconds supplements the gRPC stream
 - **Structured Audit Logging** — JSONL operational event log alongside the lifecycle JSON, providing a machine-parseable audit trail
 - **Fault Injection** — Built-in simulated blockhash expiry for end-to-end testing of the AI retry pipeline
@@ -101,7 +101,8 @@ Our system handles this by detecting missing commitment updates and executing an
 - **RPC Load Balancer Lag:** Public RPC nodes (like the default mainnet endpoint) frequently return stale blockhashes. Fetching with `processed` commitment is crucial to prevent instant blockhash expiry.
 - **Throttling RPC Calls:** Throttling block height checks to once every 2 seconds prevents rate-limiting issues on the RPC node while maintaining accurate tracking.
 - **Tip Account Randomization:** Randomly distributing tips across all 8 Jito tip accounts prevents concentration of funds and adheres to Jito guidelines.
-- **Fallback Resilience:** Restoring deterministic fallback (1.5x tip and refreshed blockhash) ensures that if the LLM API experiences rate limits or credentials are depleted, transactions are not aborted and can still land.
+- **Simulation Mismatches & Preflight Bypassing:** Public RPC load balancers often route preflight simulation requests to nodes that haven't synchronized the latest blockhash, causing false `Blockhash not found` errors. Our standard RPC fallback bypasses this by intentionally using `skip_preflight: true`, shifting the simulation burden to the actual validator execution phase.
+- **Fallback Resilience:** Dual-submitting to standard RPC endpoints alongside Jito guarantees that transactions land even when Jito block engines silently drop bundles or when Jito validators are sparse. Furthermore, deterministic retry fallbacks ensure that if the LLM API experiences rate limits, transactions are still recovered using a 1.5x tip multiplier.
 
 ## License
 

@@ -171,8 +171,9 @@ Submission Workflow
 4. Build tip transaction.
 5. Assemble bundle.
 6. Serialize transactions.
-7. Submit bundle to Jito.
-8. Record lifecycle metadata.
+7. Submit bundle to Jito Block Engine.
+8. Dual-submit the underlying transaction via standard RPC with `skip_preflight: true` as a robust fallback.
+9. Record lifecycle metadata.
 
 5.4 Lifecycle Tracker
 Purpose
@@ -241,8 +242,10 @@ Tradeoffs between Yellowstone and RPC polling
 - **Yellowstone:** Provides near-instant updates and accurate slot progression, but requires maintaining a persistent gRPC connection, handling disconnects, and writing exponential backoff logic.
 - **RPC Polling:** Simpler to implement via HTTP requests, but introduces high latency, misses intermediate commitment states, and can quickly hit rate limits.
 
-RPC Fallback Strategy when Yellowstone disconnects
-While the primary ingestion relies on Yellowstone, the system runs a parallel asynchronous task that polls standard RPC signature statuses every 8 seconds. This acts as a robust fallback. If Yellowstone drops a message or disconnects (before exponential backoff reconnects it), the RPC polling ensures that transaction confirmations are still reliably tracked.
+RPC Fallback Strategy & Preflight Bypassing
+While the primary ingestion relies on Yellowstone, the system runs parallel standard RPC fallback mechanisms for both monitoring and submission:
+1. **Submission Fallback (Dual-Submission):** The Bundle Builder simultaneously submits the transaction to the standard RPC endpoint alongside the Jito Block Engine. This guarantees inclusion on networks (like Devnet) where Jito bundles are frequently dropped or validators are scarce. Crucially, the standard RPC fallback uses `skip_preflight: true`. This circumvents false `Blockhash not found` simulation errors caused by public load-balancers routing preflight checks to nodes with lagging block heights.
+2. **Monitoring Fallback:** An asynchronous task polls standard RPC signature statuses every 8 seconds. If Yellowstone drops a message or disconnects, the RPC polling ensures that transaction confirmations are still reliably tracked.
 
 Regional Latency Considerations for Block Engine
 The Jito Block Engine operates multiple regional endpoints. The system connects to the Amsterdam endpoint (`amsterdam.mainnet.block-engine.jito.wtf`) by default, but this can be overridden via environment variables. Choosing the endpoint closest to the host infrastructure minimizes bundle submission latency, increasing the chance of landing in the narrow Jito leader window.
