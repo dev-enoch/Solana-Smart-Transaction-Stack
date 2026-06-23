@@ -44,15 +44,17 @@ When failures occur, the **AI Agent** receives the failure context and autonomou
    ```
 
    **Where to get environment values:**
-   - `NETWORK`: Set to `mainnet` or `devnet` to toggle your environment. The stack will use the corresponding `MAINNET_` or `DEVNET_` prefixed URLs.
-   - `RPC_URL`: Get a Solana RPC endpoint from providers like [Helius](https://helius.dev), [QuickNode](https://quicknode.com), [Alchemy](https://alchemy.com), or [Triton](https://triton.one).
-   - `YELLOWSTONE_ENDPOINT` & `X_TOKEN`: You need a Geyser/Yellowstone gRPC provider. Available via [Triton](https://triton.one), [Helius](https://helius.dev), or by running your own node with the Yellowstone Geyser plugin.
-   - `JITO_BLOCK_ENGINE_URL`: Standard Jito endpoints (e.g. `amsterdam.mainnet.block-engine.jito.wtf`). Check the [Jito Docs](https://jito-foundation.gitbook.io/mev) for regional URLs.
-   - `JITO_VALIDATORS`: Real Jito validator identity pubkeys. You can query the Jito API or block explorers to find active Jito validators.
-   - `PRIVATE_KEY`: Generate a testing keypair via `cargo run --bin keygen` (devnet funded) or export a byte array from Phantom/Solflare for mainnet testing. Ensure the wallet has SOL on the network you intend to test.
-   - `AI_API_KEY` or `GEMINI_API_KEY`: Get an API key from [xAI](https://console.x.ai), [Google AI Studio](https://aistudio.google.com), or [OpenAI](https://platform.openai.com).
+   - `NETWORK`: Set to `mainnet` or `devnet` to quickly switch environments.
+   - `DEVNET_RPC_URL` / `MAINNET_RPC_URL`: Get a Solana RPC endpoint from providers like [Helius](https://helius.dev) or [QuickNode](https://quicknode.com).
+   - `DEVNET_YELLOWSTONE_ENDPOINT` / `MAINNET_YELLOWSTONE_ENDPOINT`: Geyser/Yellowstone gRPC provider URL.
+   - `DEVNET_YELLOWSTONE_X_TOKEN` / `MAINNET_YELLOWSTONE_X_TOKEN`: Token for gRPC access.
+   - `DEVNET_JITO_BLOCK_ENGINE_URL` / `MAINNET_JITO_BLOCK_ENGINE_URL`: Standard Jito endpoints (e.g. `amsterdam.mainnet.block-engine.jito.wtf`).
+   - `JITO_VALIDATORS`: Comma-separated list of known Jito validator pubkeys for leader targeting.
+   - `PRIVATE_KEY`: Generate a testing keypair via `cargo run --bin keygen`.
+   - `AI_API_URL`: The LLM provider API endpoint (e.g., `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`).
+   - `AI_API_KEY`: Your primary AI API key.
    - `AI_MODEL`: Set to the specific model string (e.g., `gemini-2.5-flash`).
-   - `AI_API_URL`: Set to the corresponding API endpoint (e.g., `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent`).
+   - `AI_FALLBACK_API_URL`, `AI_FALLBACK_API_KEY`, `AI_FALLBACK_MODEL`: Optional fallback provider details.
 
 3. **Generate a Keypair (if needed)**
    ```bash
