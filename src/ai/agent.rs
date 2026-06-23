@@ -1,6 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use tracing::info;
+use colored::*;
 
 use crate::types::ai::{AgentDecision, FailureContext};
 
@@ -62,7 +63,7 @@ impl AiAgent {
             Err(e) => {
                 if let (Some(fallback_url), Some(fallback_key)) = (&self.fallback_url, &self.fallback_key) {
                     let fallback_model = self.fallback_model.as_deref().unwrap_or("grok-3-mini-fast");
-                    info!("Primary LLM failed: {:?}. Attempting fallback LLM...", e);
+                    info!("{} Primary LLM failed: {:?}. Attempting fallback LLM...", "[AI DECISION]".magenta(), e);
                     match self.call_llm_endpoint(fallback_url, fallback_key, fallback_model, &prompt).await {
                         Ok(resp) => resp,
                         Err(fallback_err) => {
@@ -79,7 +80,7 @@ impl AiAgent {
 
         let decision: AgentDecision = serde_json::from_str(&response)
             .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {} - error: {}", response, e))?;
-        info!("AI Decision: {} -> {}", decision.reasoning, decision.action);
+        info!("{} {} -> {}", "[AI DECISION]".magenta(), decision.reasoning, decision.action);
         Ok(decision)
     }
 

@@ -6,6 +6,7 @@ use solana_sdk::signature::Signature;
 use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{info, warn};
+use colored::*;
 
 use crate::logging::{OperationalEvent, StructuredLogger};
 use crate::types::lifecycle::LifecycleEntry;
@@ -292,8 +293,8 @@ impl LifecycleTracker {
                     ..
                 } => {
                     info!(
-                        "Commitment: {} → {} at slot {} (latency: {:?}ms)",
-                        bundle_id, commitment, slot, latency_ms
+                        "{} Commitment: {} → {} at slot {} (latency: {:?}ms)",
+                        "[TRACKER]".green(), bundle_id, commitment, slot, latency_ms
                     );
                 }
                 OperationalEvent::FailureDetected {
@@ -301,7 +302,7 @@ impl LifecycleTracker {
                     failure_type,
                     ..
                 } => {
-                    warn!("Failure: {} — {}", bundle_id, failure_type);
+                    warn!("{} Failure: {} — {}", "[TRACKER]".red(), bundle_id, failure_type);
                 }
                 _ => {}
             }
@@ -363,7 +364,7 @@ impl LifecycleTracker {
 
         if let Some(ref evt) = event {
             self.logger.log(evt).await;
-            warn!("Classified failure for {}: {}", bundle_id, error_msg);
+            warn!("{} Classified failure for {}: {}", "[TRACKER]".red(), bundle_id, error_msg);
         }
     }
 
@@ -394,7 +395,7 @@ impl LifecycleTracker {
         if let Some(mut entry) = self.entries.get_mut(bundle_id) {
             entry.status = "failed".to_string();
             entry.failure_type = Some(failure_type.clone());
-            warn!("Recorded failure for {}: {}", bundle_id, failure_type);
+            warn!("{} Recorded failure for {}: {}", "[TRACKER]".red(), bundle_id, failure_type);
         }
     }
 
@@ -413,8 +414,8 @@ impl LifecycleTracker {
                         entry.failure_type = Some("expired_blockhash".to_string());
                         let age_ms = (Utc::now() - entry.submitted_at).num_milliseconds();
                         warn!(
-                            "Blockhash expiry detected for bundle {} (block_height {} > last_valid {})",
-                            bid, current_block_height, lvbh
+                            "{} Blockhash expiry detected for bundle {} (block_height {} > last_valid {})",
+                            "[TRACKER]".red(), bid, current_block_height, lvbh
                         );
                         expired.push((
                             entry.intent_id.clone(),
@@ -499,7 +500,7 @@ impl LifecycleTracker {
         let values: Vec<_> = self.entries.iter().map(|e| e.value().clone()).collect();
         let json = serde_json::to_string_pretty(&values)?;
         tokio::fs::write(&self.log_file, json).await?;
-        info!("Lifecycle logs saved ({} entries)", values.len());
+        info!("{} Lifecycle logs saved ({} entries)", "[TRACKER]".green(), values.len());
         Ok(())
     }
 

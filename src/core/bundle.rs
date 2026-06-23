@@ -7,6 +7,7 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 use tracing::info;
+use colored::*;
 use reqwest::Client;
 use solana_client::nonblocking::rpc_client::RpcClient;
 
@@ -48,7 +49,7 @@ impl BundleBuilder {
         // Use AI-recommended tip if provided, otherwise calculate dynamically
         let tip_lamports = match override_tip {
             Some(tip) => {
-                info!("Using AI-overridden tip: {} lamports", tip);
+                info!("{} Using AI-overridden tip: {} lamports", "[BUNDLE]".cyan(), tip);
                 tip
             }
             None => {
@@ -59,8 +60,8 @@ impl BundleBuilder {
         };
 
         info!(
-            "Building tip transaction: {} lamports to {}",
-            tip_lamports, tip_account
+            "{} Building tip transaction: {} lamports to {}",
+            "[BUNDLE]".cyan(), tip_lamports, tip_account
         );
 
         // Fetch fresh blockhash with processed commitment for minimum validity lag.
@@ -83,8 +84,8 @@ impl BundleBuilder {
         transactions.push(versioned_tx);
 
         info!(
-            "Constructing Jito bundle with {} transactions...",
-            transactions.len()
+            "{} Constructing Jito bundle with {} transactions...",
+            "[BUNDLE]".cyan(), transactions.len()
         );
 
         // Serialize and encode all transactions
@@ -127,9 +128,23 @@ impl BundleBuilder {
             .to_string();
 
         info!(
-            "Bundle submitted! ID: {} at slot {} (tip: {} lamports)",
-            bundle_id, slot, tip_lamports
+            "{} Bundle submitted! ID: {} at slot {} (tip: {} lamports)",
+            "[BUNDLE]".cyan(), bundle_id, slot, tip_lamports
         );
+
+        // Fallback: If we are testing on Devnet and sending to Mainnet Jito, the Jito block engine will silently drop the bundle.
+        // To ensure the transactions actually land and can be tracked, we also submit them individually to the standard RPC.
+        for tx in &transactions {
+            if let Err(e) = self.rpc_client.send_transaction_with_config(
+                tx,
+                solana_client::rpc_config::RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..solana_client::rpc_config::RpcSendTransactionConfig::default()
+                }
+            ).await {
+                tracing::error!("Standard RPC submission error (expected if bundle lands first): {}", e);
+            }
+        }
 
         Ok((bundle_id, signatures, last_valid_block_height, tip_lamports))
     }

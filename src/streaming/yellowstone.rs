@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use std::time::Duration;
+use colored::*;
 
 use tonic::{Request, Status};
 use tonic::metadata::AsciiMetadataValue;
@@ -139,7 +140,7 @@ impl YellowstoneStreamer {
             match grpc_client.ready().await {
                 Ok(_) => {},
                 Err(e) => {
-                    error!("gRPC client ready failed: {}", e);
+                    error!("{} gRPC client ready failed: {}", "[STREAM]".blue(), e);
                     tokio::time::sleep(backoff).await;
                     continue;
                 }
@@ -151,7 +152,7 @@ impl YellowstoneStreamer {
             let response = match grpc_client.streaming(request, path, codec).await {
                 Ok(r) => r,
                 Err(e) => {
-                    error!("Yellowstone subscription error: {}", e);
+                    error!("{} Yellowstone subscription error: {}", "[STREAM]".blue(), e);
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));
                     continue;
@@ -159,7 +160,7 @@ impl YellowstoneStreamer {
             };
             
             backoff = Duration::from_secs(1);
-            info!("Successfully connected to Yellowstone gRPC stream");
+            info!("{} Successfully connected to Yellowstone gRPC stream", "[STREAM]".blue());
 
             if let Ok(current) = self.rpc_client.get_slot().await {
                 if let Err(e) = self.update_leader_schedule(current).await {
@@ -241,7 +242,7 @@ impl YellowstoneStreamer {
                 }
             }
 
-            error!("Yellowstone stream disconnected. Reconnecting in {:?}", backoff);
+            error!("{} Yellowstone stream disconnected. Reconnecting in {:?}", "[STREAM]".blue(), backoff);
             tokio::time::sleep(backoff).await;
             backoff = std::cmp::min(backoff * 2, Duration::from_secs(30));
         }

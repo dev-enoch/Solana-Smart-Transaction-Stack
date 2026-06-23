@@ -11,6 +11,7 @@ use solana_smart_tx_stack_rs::types::streaming::StreamEvent;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing::Instrument;
+use colored::*;
 use solana_sdk::signature::Signer;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::collections::VecDeque;
@@ -39,8 +40,13 @@ struct Intent {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenv().ok();
-    tracing_subscriber::fmt::init();
-    info!("====== Starting solana-smart-tx-stack-rs ======");
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .init();
+    info!("{}", "====== Starting solana-smart-tx-stack-rs ======".bright_green().bold());
 
 
     let network = std::env::var("NETWORK")
@@ -52,13 +58,13 @@ async fn main() -> Result<()> {
         .or_else(|_| std::env::var("YELLOWSTONE_ENDPOINT"))
         .unwrap_or_else(|_| "http://localhost:50051".to_string());
     
-    let x_token = std::env::var(format!("{}YELLOWSTONE_X_TOKEN", prefix))
-        .or_else(|_| std::env::var("YELLOWSTONE_X_TOKEN"))
-        .ok();
-
     let jito_url = std::env::var(format!("{}JITO_BLOCK_ENGINE_URL", prefix))
         .or_else(|_| std::env::var("JITO_BLOCK_ENGINE_URL"))
         .unwrap_or_else(|_| "https://amsterdam.mainnet.block-engine.jito.wtf".to_string());
+    
+    let x_token = std::env::var(format!("{}YELLOWSTONE_X_TOKEN", prefix))
+        .or_else(|_| std::env::var("YELLOWSTONE_X_TOKEN"))
+        .ok();
 
     let rpc_url = std::env::var(format!("{}RPC_URL", prefix))
         .or_else(|_| std::env::var("RPC_URL"))
@@ -122,7 +128,7 @@ async fn main() -> Result<()> {
     logger.log(&OperationalEvent::SystemStartup {
         timestamp: chrono::Utc::now(),
         network,
-        rpc_url,
+        rpc_url: rpc_url.clone(),
         jito_url,
         yellowstone_endpoint: endpoint.clone(),
         ai_primary_provider: ai_model,
@@ -138,7 +144,7 @@ async fn main() -> Result<()> {
         event_tx,
         rpc_client.clone(),
         payer.pubkey().to_string(),
-        jito_validators,
+        jito_validators.clone(),
     )
     .await?;
 
@@ -388,8 +394,8 @@ async fn main() -> Result<()> {
                                         .await;
 
                                         info!(
-                                            "AI → refresh_blockhash | tip: {:?} | retry {}/{}",
-                                            new_intent.override_tip, next_retry, MAX_RETRIES
+                                            "{} AI → refresh_blockhash | tip: {:?} | retry {}/{}",
+                                            "[AI DECISION]".magenta(), new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
                                         q.lock().await.push_back(new_intent);
                                     }
@@ -416,8 +422,8 @@ async fn main() -> Result<()> {
                                         .await;
 
                                         info!(
-                                            "AI → retry_higher_tip | tip: {:?} | retry {}/{}",
-                                            new_intent.override_tip, next_retry, MAX_RETRIES
+                                            "{} AI → retry_higher_tip | tip: {:?} | retry {}/{}",
+                                            "[AI DECISION]".magenta(), new_intent.override_tip, next_retry, MAX_RETRIES
                                         );
                                         q.lock().await.push_back(new_intent);
                                     }
@@ -447,13 +453,13 @@ async fn main() -> Result<()> {
                                         })
                                         .await;
 
-                                        info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
+                                        info!("{} AI → wait until slot {:?} | retry {}/{}", "[AI DECISION]".magenta(), target, next_retry, MAX_RETRIES);
                                         q.lock().await.push_back(new_intent);
                                     }
                                     "abort" => {
                                         info!(
-                                            "AI → abort bundle {} (reason: {})",
-                                            bundle_id, decision.reasoning
+                                            "{} AI → abort bundle {} (reason: {})",
+                                            "[AI DECISION]".magenta(), bundle_id, decision.reasoning
                                         );
                                         log.log(&OperationalEvent::FailureDetected {
                                             timestamp: Utc::now(),
@@ -784,7 +790,7 @@ async fn main() -> Result<()> {
                                                 })
                                                 .await;
 
-                                                info!("AI → refresh_blockhash | tip: {:?} | retry {}/{}", new_intent.override_tip, next_retry, MAX_RETRIES);
+                                                info!("{} AI → refresh_blockhash | tip: {:?} | retry {}/{}", "[AI DECISION]".magenta(), new_intent.override_tip, next_retry, MAX_RETRIES);
                                                 q.lock().await.push_back(new_intent);
                                             }
                                             "retry_higher_tip" => {
@@ -809,7 +815,7 @@ async fn main() -> Result<()> {
                                                 })
                                                 .await;
 
-                                                info!("AI → retry_higher_tip | tip: {:?} | retry {}/{}", new_intent.override_tip, next_retry, MAX_RETRIES);
+                                                info!("{} AI → retry_higher_tip | tip: {:?} | retry {}/{}", "[AI DECISION]".magenta(), new_intent.override_tip, next_retry, MAX_RETRIES);
                                                 q.lock().await.push_back(new_intent);
                                             }
                                             "wait" => {
@@ -835,11 +841,11 @@ async fn main() -> Result<()> {
                                                 })
                                                 .await;
 
-                                                info!("AI → wait until slot {:?} | retry {}/{}", target, next_retry, MAX_RETRIES);
+                                                info!("{} AI → wait until slot {:?} | retry {}/{}", "[AI DECISION]".magenta(), target, next_retry, MAX_RETRIES);
                                                 q.lock().await.push_back(new_intent);
                                             }
                                             "abort" => {
-                                                info!("AI → abort bundle {} (reason: {})", bundle_id, decision.reasoning);
+                                                info!("{} AI → abort bundle {} (reason: {})", "[AI DECISION]".magenta(), bundle_id, decision.reasoning);
                                                 log.log(&OperationalEvent::FailureDetected {
                                                     timestamp: Utc::now(),
                                                     bundle_id: bundle_id.clone(),
