@@ -1,0 +1,78 @@
+================================================================================
+SOLANA SMART TRANSACTION STACK - PRODUCT WALKTHROUGH & VIDEO DEMO GUIDE
+================================================================================
+
+This document serves as a comprehensive explanation and walk-through script to accompany a video recording of the Solana Smart Transaction Infrastructure Stack. It explains what has been built, how the components function under the hood, and how to demonstrate the entire stack in action.
+
+--------------------------------------------------------------------------------
+1. INTRODUCTION: WHAT MAKES THIS STACK "SMART"?
+--------------------------------------------------------------------------------
+On Solana, sending a transaction is only the beginning of the story. Between slot updates, leader schedules, TPU ingestion, and block production, transactions face multiple points of failure (e.g., blockhash expiration, RPC load-balancer lag, and Jito engine rate limits). 
+
+This project is a production-quality "Smart Transaction Stack" built in Rust and Next.js. It is "Smart" because:
+- It doesn't blindly submit transactions; it tracks Solana leaders using Yellowstone gRPC (Geyser) streams to target slots when Jito block production leaders are active.
+- It dynamically calculates validator tips and randomizes Jito tip accounts to prevent validators from getting overloaded.
+- It is self-healing: if a transaction fails (e.g. expired blockhash or execution error), an AI Agent automatically diagnoses the failure and initiates recovery actions (retry, tip multipliers, or delays).
+- It provides a responsive real-time dashboard with a retractable sidebar on mobile viewports for clean, off-canvas navigation.
+
+--------------------------------------------------------------------------------
+2. ARCHITECTURAL LAYER-BY-LAYER WALKTHROUGH
+--------------------------------------------------------------------------------
+
+Layer 1: Real-time Ingestion Layer (Yellowstone Streamer)
+- Code location: [src/streaming/yellowstone.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/streaming/yellowstone.rs)
+- Streams slot and transaction updates via a persistent gRPC connection.
+- Implements a Look-Ahead Cache that analyzes the upcoming leader schedule. It targets optimal submission windows when a Jito-enabled validator is scheduled to produce blocks in the next 4 slots.
+
+Layer 2: Core Transaction Engine (Tip Manager & Bundle Builder)
+- Code locations: [src/core/tip.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/core/tip.rs), [src/core/bundle.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/core/bundle.rs)
+- Tip Manager: Fetches real-time tips and randomizes the tip account selection across all 8 Jito validator accounts (rather than hardcoding a single address), preventing rate limits and validators hot-spotting.
+- Bundle Builder: Switch queries for the latest blockhash to `processed` commitment instead of `confirmed`. This guarantees the blockhash is fresh from the tip of the chain, completely mitigating load-balancer lag.
+
+Layer 3: Tracking Layer (Lifecycle Tracker)
+- Code location: [src/logging/mod.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/logging/mod.rs)
+- Monitors transaction status changes (Finalized, Confirmed, Processed, Pending, Failed) from both the Yellowstone gRPC stream and a secondary RPC fallback polling loop.
+- Classifies failures based on transaction status codes (e.g. BlockhashExpired, ExecutionFailure).
+
+Layer 4: AI & Fallback Decision Layer (AI Agent & Deterministic Fallback)
+- Code locations: [src/ai/agent.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/ai/agent.rs), [src/types/ai.rs](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/src/types/ai.rs)
+- Multi-LLM API Integration: Supports auto-detection of Gemini, Grok, OpenAI, and Ollama endpoint URLs.
+- The AI Agent evaluates failed transactions, writes a reason, and recommends a decision:
+  - `Retry`: Re-submits with a refreshed blockhash and a multiplier tip.
+  - `Delay`: Retries after a specific delay.
+  - `Abort`: Aborts the bundle chain.
+- Deterministic Fallback: If LLM APIs are offline, rate-limited, or timeout, a hardcoded fallback automatically refreshes the blockhash, applies a 1.5x tip multiplier, and retries the transaction.
+
+Layer 5: Visualization & Control Layer (Next.js Responsive Dashboard)
+- Code locations: [dashboard/src/app/page.tsx](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/dashboard/src/app/page.tsx), [dashboard/src/app/globals.css](file:///c:/Users/Enoch/Desktop/Works/solana-smart-tx-stack-rs/dashboard/src/app/globals.css)
+- Shows real-time charts of transaction statuses, latencies, Jito tips, and operational logs.
+- Fully responsive styling that collapses the fixed sidebar into a retractable mobile drawer menu button (hamburger toggle) on smaller viewports, complete with tap-to-close overlay backdrops.
+
+--------------------------------------------------------------------------------
+3. STEP-BY-STEP VIDEO DEMONSTRATION SCRIPT
+--------------------------------------------------------------------------------
+
+Scene 1: Introduction to the Project
+- [Action]: Show the directory structure of the repository.
+- [Voiceover]: "Here we have the Solana Smart Transaction Infrastructure Stack. It consists of a high-performance Rust backend that connects directly to Yellowstone gRPC Geyser streams and Jito block engines, paired with a Next.js real-time monitoring dashboard."
+
+Scene 2: Running the Stack and gRPC Slot Stream
+- [Action]: In one terminal, run `cargo run`. Show the output logging slot updates and looking ahead at Jito leaders.
+- [Voiceover]: "When we launch the stack, the Yellowstone Streamer establishes a gRPC session. You can see it streaming slot numbers in real-time. It targets upcoming Jito leaders to ensure our transaction bundles are submitted in the absolute best slot windows."
+
+Scene 3: Real-Time Web Dashboard (Desktop View)
+- [Action]: Open a browser to `http://localhost:3000`. Show the statistics grid (Success Rate, Total Transactions, average Jito tip, latency graphs) and list of recent transaction logs.
+- [Voiceover]: "Here is our Next.js dashboard. It connects to the Rust backend using Server-Sent Events (SSE) to update in real-time. We can filter transactions by status—Pending, Processed, Confirmed, Finalized, or Failed—and open the side modal to see full details such as Jito slot numbers and execution latencies."
+
+Scene 4: Responsive Mobile Layout & Retractable Sidebar
+- [Action]: Shrink the browser window size to a mobile viewport (e.g. 375px width). Show the top menu bar. Click the hamburger icon to slide in the sidebar. Click on "Operational Events", then click the overlay or close button to close it.
+- [Voiceover]: "Our CSS styling is 100% responsive. On mobile screens, the left sidebar transforms into a retractable off-canvas drawer. Clicking the menu button slides it into view, and clicking anywhere on the blurred backdrop automatically retracts it, maximizing screen real estate."
+
+Scene 5: Simulating a Failure & AI Autonomous Recovery
+- [Action]: In the terminal, show the AI agent triggering when a simulated error occurs (e.g. expired blockhash). Point out how the AI agent auto-detects the provider type, inspects the error, and outputs the decision to retry with a tip multiplier.
+- [Voiceover]: "Watch what happens when a transaction encounters an expired blockhash. Rather than aborting, the lifecycle tracker flags the failure. The AI agent immediately takes over, evaluates the slot context, auto-detects our configured Ollama/Gemini endpoint, and decides to retry the bundle using a refreshed blockhash and a tip multiplier."
+
+Scene 6: Conclusion
+- [Action]: Show the clean `Architecture Document.txt` and `README.md`.
+- [Voiceover]: "This stack represents a complete, self-healing smart transaction system designed for high reliability and production-quality operations on Solana."
+================================================================================
